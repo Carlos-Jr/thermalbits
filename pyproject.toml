@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thermalbits"
+version = "0.1.0"
+description = "Library for parsing combinational Verilog netlists and generating ThermalBits overviews"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Carlos D.S. Junior (https://github.com/Carlos-Jr)" }
+]
+keywords = ["verilog", "eda", "netlist", "logic", "landauer"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = []
+
+[project.optional-dependencies]
+viz = [
+  "matplotlib>=3.8",
+]
+dev = [
+  "build>=1.2.2",
+  "twine>=5.1.1",
+  "pytest>=8.3.0",
+  "ruff>=0.8.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["thermalbits*"]
+exclude = ["test_files*"]

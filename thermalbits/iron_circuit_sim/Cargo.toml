@@ -1,0 +1,17 @@
+[package]
+name = "circuit_sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# target-cpu = "native" deve ser passado via RUSTFLAGS, não aqui.
+# Use: RUSTFLAGS="-C target-cpu=native" cargo build --release
