@@ -299,14 +299,14 @@ def extract_gate_from_expr(
     output_signal: str,
 ) -> tuple[str, list[tuple[str, int]]]:
     """
-    Extrai uma porta de uma expressao:
+    Extrai um fanout simples de uma expressao:
       - Apenas '&', '|' e '~' sao permitidos
       - '~' so pode aparecer diretamente em um literal
-      - Cada atribuicao deve resultar em uma unica porta de 2 entradas
+      - Cada atribuicao deve resultar em uma unica saida simples
 
-    Se a expressao tiver apenas um literal, ela e tratada como porta degenerada:
-      x -> x & x
-      ~x -> ~x & ~x
+    Se a expressao tiver apenas um literal, ela e tratada como um fio:
+      x -> "-"
+      ~x -> "-" com inversao local
     """
     tokens = _strip_outer_parentheses(_tokenize_expr(expr))
 
@@ -323,7 +323,7 @@ def extract_gate_from_expr(
 
     if len(literals) not in (1, 2):
         raise ValueError(
-            f"Assignments must have exactly 2 fanins (or 1 literal for a degenerate gate): {expr}"
+            f"Assignments must have exactly 1 or 2 literals: {expr}"
         )
 
     # Simplificacao local para permitir constantes 1-bit (ex.: 1'b1).
@@ -358,8 +358,7 @@ def extract_gate_from_expr(
             const_value = _parse_const_token(signal_name) ^ inv
             anchor_signal = _pick_anchor_signal(known_signals, forbidden=[output_signal])
             return _const_to_gate(const_value, anchor_signal)
-        literals = [(signal_name, inv), (signal_name, inv)]
-        gate_op = "&"
+        return "-", [(signal_name, inv)]
     elif simplified_const is not None:
         anchor_signal = _pick_anchor_signal(known_signals, forbidden=[output_signal])
         return _const_to_gate(simplified_const, anchor_signal)

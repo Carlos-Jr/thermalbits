@@ -29,6 +29,33 @@ def _build_signal_ids(inputs, gates):
     return signal_to_id
 
 
+def _build_node_fanin_and_fanout(gate, signal_to_id):
+    output_name = gate["output"]  # type: ignore[index]
+    fanin_terms = gate["fanin"]  # type: ignore[index]
+
+    fanin_refs: list[list[int]] = []
+    ref_to_index: dict[tuple[int, int], int] = {}
+    fanout_input: list[int] = []
+    fanout_invert: list[int] = []
+
+    for fanin_name, inv in fanin_terms:
+        if fanin_name not in signal_to_id:
+            raise ValueError(
+                f"Signal '{fanin_name}' used by '{output_name}' has no assigned integer ID"
+            )
+        ref = (signal_to_id[fanin_name], 0)
+        input_idx = ref_to_index.get(ref)
+        if input_idx is None:
+            input_idx = len(fanin_refs)
+            ref_to_index[ref] = input_idx
+            fanin_refs.append([ref[0], ref[1]])
+
+        fanout_input.append(input_idx)
+        fanout_invert.append(int(inv))
+
+    return fanin_refs, fanout_input, fanout_invert
+
+
 def _compute_overview(verilog_path: str):
     inputs, outputs, wires, assigns = load_verilog(verilog_path)
     assign_dests = [dest for dest, _ in assigns]
@@ -43,21 +70,23 @@ def _compute_overview(verilog_path: str):
     for gate in gates:
         output_name = gate["output"]  # type: ignore[index]
         output_id = signal_to_id[output_name]
-        fanin_terms = gate["fanin"]  # type: ignore[index]
         cone_inputs = compute_cone_for_gate(output_name, inputs, drivers)
-        fanin = []
-        for fanin_name, inv in fanin_terms:
-            if fanin_name not in signal_to_id:
-                raise ValueError(
-                    f"Signal '{fanin_name}' used by '{output_name}' has no assigned integer ID"
-                )
-            fanin.append([signal_to_id[fanin_name], int(inv)])
+        fanin, fanout_input, fanout_invert = _build_node_fanin_and_fanout(
+            gate,
+            signal_to_id,
+        )
 
         nodes.append(
             {
                 "id": output_id,
-                "op": gate["op"],  # type: ignore[index]
                 "fanin": fanin,
+                "fanout": [
+                    {
+                        "input": fanout_input,
+                        "invert": fanout_invert,
+                        "op": gate["op"],  # type: ignore[index]
+                    }
+                ],
                 "level": int(levels.get(output_name, 0)),
                 "suport": [signal_to_id[name] for name in cone_inputs],
             }

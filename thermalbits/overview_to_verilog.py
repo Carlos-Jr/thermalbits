@@ -1,4 +1,5 @@
 import re
+from itertools import combinations
 
 from .generate_overview import _state_overview
 
@@ -27,6 +28,30 @@ def _literal_expr(signal_name: str, inv: int) -> str:
     return f"~{signal_name}" if inv else signal_name
 
 
+def _join_terms(terms: list[str], op: str) -> str:
+    if not terms:
+        raise ValueError("A fanout expression requires at least one input term")
+    if len(terms) == 1:
+        return terms[0]
+    return f" {op} ".join(terms)
+
+
+def _majority_expr(terms: list[str]) -> str:
+    if not terms:
+        raise ValueError("Majority requires at least one input")
+    if len(terms) % 2 == 0:
+        raise ValueError("Majority requires an odd number of inputs")
+
+    threshold = len(terms) // 2 + 1
+    product_terms = []
+    for combo in combinations(terms, threshold):
+        product = _join_terms(list(combo), "&")
+        if len(combo) > 1:
+            product = f"({product})"
+        product_terms.append(product)
+    return _join_terms(product_terms, "|")
+
+
 def _parse_nodes(nodes_raw: object) -> dict[int, dict[str, object]]:
     if not isinstance(nodes_raw, list):
         raise ValueError("Overview field 'nodes' must be a list")
@@ -42,30 +67,127 @@ def _parse_nodes(nodes_raw: object) -> dict[int, dict[str, object]]:
         if node_id in parsed:
             raise ValueError(f"Duplicated node id in overview: {node_id}")
 
-        if "op" not in node:
-            raise ValueError(f"Node {node_id} must contain field 'op'")
-        op = node.get("op")
-        if op not in ("&", "|"):
-            raise ValueError(f"Unsupported node operator for id {node_id}: {op}")
-
         fanin_raw = node.get("fanin")
-        if not isinstance(fanin_raw, list) or len(fanin_raw) != 2:
-            raise ValueError(f"Node {node_id} must contain exactly 2 fanins")
+        if not isinstance(fanin_raw, list):
+            raise ValueError(f"Node {node_id} field 'fanin' must be a list")
 
         fanin: list[tuple[int, int]] = []
         for item in fanin_raw:
             if not isinstance(item, list) or len(item) != 2:
                 raise ValueError(f"Node {node_id} has invalid fanin entry: {item}")
-            fanin_id, inv = item
+            fanin_id, output_index = item
             if not isinstance(fanin_id, int):
                 raise ValueError(f"Node {node_id} has non-integer fanin id: {fanin_id}")
-            if inv not in (0, 1):
-                raise ValueError(f"Node {node_id} has invalid inversion flag: {inv}")
-            fanin.append((fanin_id, inv))
+            if not isinstance(output_index, int) or output_index < 0:
+                raise ValueError(
+                    f"Node {node_id} has invalid fanin output index: {output_index}"
+                )
+            fanin.append((fanin_id, output_index))
 
-        parsed[node_id] = {"op": op, "fanin": fanin}
+        fanout_raw = node.get("fanout")
+        if not isinstance(fanout_raw, list) or not fanout_raw:
+            raise ValueError(f"Node {node_id} field 'fanout' must be a non-empty list")
+
+        fanout: list[dict[str, object]] = []
+        for fanout_idx, fanout_entry in enumerate(fanout_raw):
+            if not isinstance(fanout_entry, dict):
+                raise ValueError(
+                    f"Node {node_id} has invalid fanout entry at index {fanout_idx}"
+                )
+
+            input_raw = fanout_entry.get("input")
+            invert_raw = fanout_entry.get("invert")
+            op = fanout_entry.get("op")
+
+            if not isinstance(input_raw, list):
+                raise ValueError(
+                    f"Node {node_id} fanout[{fanout_idx}] field 'input' must be a list"
+                )
+            if not isinstance(invert_raw, list):
+                raise ValueError(
+                    f"Node {node_id} fanout[{fanout_idx}] field 'invert' must be a list"
+                )
+            if len(input_raw) != len(invert_raw):
+                raise ValueError(
+                    f"Node {node_id} fanout[{fanout_idx}] fields 'input' and 'invert' must have the same length"
+                )
+            if op not in ("&", "|", "^", "M", "-"):
+                raise ValueError(
+                    f"Unsupported node operator for id {node_id} fanout[{fanout_idx}]: {op}"
+                )
+
+            input_indices: list[int] = []
+            invert_flags: list[int] = []
+            for input_idx in input_raw:
+                if not isinstance(input_idx, int) or input_idx < 0:
+                    raise ValueError(
+                        f"Node {node_id} fanout[{fanout_idx}] has invalid input index: {input_idx}"
+                    )
+                if input_idx >= len(fanin):
+                    raise ValueError(
+                        f"Node {node_id} fanout[{fanout_idx}] references fanin index {input_idx}, but fanin has size {len(fanin)}"
+                    )
+                input_indices.append(input_idx)
+            for invert_flag in invert_raw:
+                if invert_flag not in (0, 1):
+                    raise ValueError(
+                        f"Node {node_id} fanout[{fanout_idx}] has invalid invert flag: {invert_flag}"
+                    )
+                invert_flags.append(invert_flag)
+
+            if not input_indices:
+                raise ValueError(f"Node {node_id} fanout[{fanout_idx}] must have inputs")
+            if op == "-" and len(input_indices) != 1:
+                raise ValueError(
+                    f"Node {node_id} fanout[{fanout_idx}] wire output must have exactly 1 input"
+                )
+            if op == "M" and len(input_indices) % 2 == 0:
+                raise ValueError(
+                    f"Node {node_id} fanout[{fanout_idx}] majority output must have an odd number of inputs"
+                )
+
+            fanout.append(
+                {
+                    "input": input_indices,
+                    "invert": invert_flags,
+                    "op": op,
+                }
+            )
+
+        level = node.get("level", 0)
+        if not isinstance(level, int):
+            raise ValueError(f"Node {node_id} field 'level' must be an integer")
+
+        parsed[node_id] = {"fanin": fanin, "fanout": fanout, "level": level}
 
     return parsed
+
+
+def _fanout_expr(
+    node_id: int,
+    fanout_idx: int,
+    node: dict[str, object],
+    signal_name_by_ref: dict[tuple[int, int], str],
+) -> str:
+    fanin = node["fanin"]  # type: ignore[index]
+    fanout = node["fanout"][fanout_idx]  # type: ignore[index]
+    input_indices = fanout["input"]  # type: ignore[index]
+    invert_flags = fanout["invert"]  # type: ignore[index]
+    op = fanout["op"]  # type: ignore[index]
+
+    terms = []
+    for input_idx, invert_flag in zip(input_indices, invert_flags):
+        source_ref = fanin[input_idx]
+        signal_name = signal_name_by_ref[source_ref]
+        terms.append(_literal_expr(signal_name, invert_flag))
+
+    if op == "-":
+        return terms[0]
+    if op in ("&", "|", "^"):
+        return _join_terms(terms, op)
+    if op == "M":
+        return _majority_expr(terms)
+    raise ValueError(f"Unsupported node operator for id {node_id} fanout[{fanout_idx}]: {op}")
 
 
 def write_verilog(
@@ -90,9 +212,19 @@ def write_verilog(
     known_ids = pi_ids | node_ids
     for node_id, node in node_by_id.items():
         fanin = node["fanin"]  # type: ignore[index]
-        for fanin_id, _ in fanin:
+        for fanin_id, output_index in fanin:
             if fanin_id not in known_ids:
                 raise ValueError(f"Node {node_id} references unknown fanin id: {fanin_id}")
+            if fanin_id in pi_ids and output_index != 0:
+                raise ValueError(
+                    f"Node {node_id} references primary input {fanin_id} with invalid output index {output_index}"
+                )
+            if fanin_id in node_by_id:
+                source_fanout = node_by_id[fanin_id]["fanout"]  # type: ignore[index]
+                if output_index >= len(source_fanout):
+                    raise ValueError(
+                        f"Node {node_id} references node {fanin_id} output index {output_index}, but that node has only {len(source_fanout)} outputs"
+                    )
 
     for po_id in pos:
         if po_id not in known_ids:
@@ -106,15 +238,29 @@ def write_verilog(
             module_name = "generated_module"
     module_name = _sanitize_module_name(module_name)
 
-    signal_name_by_id: dict[int, str] = {}
+    signal_name_by_ref: dict[tuple[int, int], str] = {}
     for pi_id in pis:
-        signal_name_by_id[pi_id] = f"pi{pi_id}"
-    for node_id in sorted(node_ids):
-        signal_name_by_id[node_id] = f"n{node_id}"
+        signal_name_by_ref[(pi_id, 0)] = f"pi{pi_id}"
 
-    input_ports = [signal_name_by_id[pi_id] for pi_id in pis]
+    ordered_node_ids = sorted(
+        node_by_id,
+        key=lambda current_id: (node_by_id[current_id]["level"], current_id),  # type: ignore[index]
+    )
+    for node_id in ordered_node_ids:
+        fanout = node_by_id[node_id]["fanout"]  # type: ignore[index]
+        for fanout_idx in range(len(fanout)):
+            if fanout_idx == 0:
+                signal_name_by_ref[(node_id, fanout_idx)] = f"n{node_id}"
+            else:
+                signal_name_by_ref[(node_id, fanout_idx)] = f"n{node_id}_o{fanout_idx}"
+
+    input_ports = [signal_name_by_ref[(pi_id, 0)] for pi_id in pis]
     output_ports = [f"po{idx}" for idx in range(len(pos))]
-    wire_names = [signal_name_by_id[node_id] for node_id in sorted(node_ids)]
+    wire_names = [
+        signal_name_by_ref[(node_id, fanout_idx)]
+        for node_id in ordered_node_ids
+        for fanout_idx in range(len(node_by_id[node_id]["fanout"]))  # type: ignore[index]
+    ]
     module_ports = input_ports + output_ports
 
     lines: list[str] = []
@@ -137,20 +283,16 @@ def write_verilog(
     if node_by_id or output_ports:
         lines.append("")
 
-    for node_id in sorted(node_by_id):
+    for node_id in ordered_node_ids:
         node = node_by_id[node_id]
-        op = node["op"]  # type: ignore[index]
-        fanin = node["fanin"]  # type: ignore[index]
-        left_id, left_inv = fanin[0]
-        right_id, right_inv = fanin[1]
-        left_expr = _literal_expr(signal_name_by_id[left_id], left_inv)
-        right_expr = _literal_expr(signal_name_by_id[right_id], right_inv)
-        lines.append(
-            f"    assign {signal_name_by_id[node_id]} = {left_expr} {op} {right_expr};"
-        )
+        fanout = node["fanout"]  # type: ignore[index]
+        for fanout_idx in range(len(fanout)):
+            signal_name = signal_name_by_ref[(node_id, fanout_idx)]
+            expr = _fanout_expr(node_id, fanout_idx, node, signal_name_by_ref)
+            lines.append(f"    assign {signal_name} = {expr};")
 
     for idx, po_id in enumerate(pos):
-        lines.append(f"    assign {output_ports[idx]} = {signal_name_by_id[po_id]};")
+        lines.append(f"    assign {output_ports[idx]} = {signal_name_by_ref[(po_id, 0)]};")
 
     lines.append("endmodule")
 

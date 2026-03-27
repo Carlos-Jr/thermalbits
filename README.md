@@ -60,7 +60,15 @@ from thermalbits import ThermalBits
 tb = ThermalBits()
 tb.pi = [0, 1]
 tb.po = [2]
-tb.node = [{"id": 2, "op": "&", "fanin": [[0, 0], [1, 0]], "level": 1, "suport": [0, 1]}]
+tb.node = [
+    {
+        "id": 2,
+        "fanin": [[0, 0], [1, 0]],
+        "fanout": [{"input": [0, 1], "invert": [0, 0], "op": "&"}],
+        "level": 1,
+        "suport": [0, 1],
+    }
+]
 ```
 
 To create a full copy of an existing object:
@@ -88,8 +96,11 @@ The `out.json` file contains:
 * `pos`: Integer IDs of primary outputs.
 * `nodes`: List of logic nodes in the format:
 * `id`: Integer identifier of the node.
-* `op`: Gate operator (`&` or `|`).
-* `fanin`: Compact list `[[id, inv], [id, inv]]`, where `inv` is `0` or `1`.
+* `fanin`: List `[[node_id, output_index], ...]` describing where each local input comes from.
+* `fanout`: List of outputs produced by the node. For Verilog-generated nodes, this list usually has one element.
+* `input`: Local input positions consumed by one output.
+* `invert`: Per-input inversion flags (`0` or `1`) aligned with `input`.
+* `op`: Output operator (`&`, `|`, `^`, `M`, or `-`).
 * `level`: Logic level of the node.
 * `suport`: PI cone of the node (integer IDs).
 
@@ -239,5 +250,5 @@ Chunks are dispatched in successive batches of `parallel_chunks` until all `chun
 
 ## Observations
 * Assignments support `&`, `|`, and `~` (no `^`, `+`, etc.). One-bit constants `1'b0` and `1'b1` are also accepted.
-* Each `assign` generates a 2-fanin logic gate. If there is only one literal, a degenerate gate is generated (`x & x` or `~x & ~x`).
+* Each `assign` generates one node with a single `fanout` entry. Unary assignments are emitted with `op: "-"`.
 * Input/output paths can be absolute or relative to the current directory.

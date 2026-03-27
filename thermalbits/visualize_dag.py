@@ -37,25 +37,50 @@ def _node_color(role: str) -> str:
     return "#C9CED4"
 
 
-def _node_marker(node_id: int, op_by_id: dict[int, str], pis: set[int]) -> str:
+def _node_marker(node_id: int, node_kind_by_id: dict[int, str], pis: set[int]) -> str:
     if node_id in pis:
         return "o"
-    op = op_by_id.get(node_id)
-    if op == "&":
+    node_kind = node_kind_by_id.get(node_id)
+    if node_kind == "&":
         return "s"
-    if op == "|":
+    if node_kind == "|":
         return "D"
+    if node_kind == "^":
+        return "X"
+    if node_kind == "M":
+        return "^"
+    if node_kind == "multi":
+        return "P"
     return "o"
 
 
-def _gate_label(node_id: int, op_by_id: dict[int, str], pis: set[int], pos: set[int]) -> str:
+def _gate_label(
+    node_id: int,
+    node_kind_by_id: dict[int, str],
+    fanout_count_by_id: dict[int, int],
+    pis: set[int],
+    pos: set[int],
+) -> str:
     role = _node_role(node_id, pis, pos)
     if role == "input":
         return f"PI {node_id}"
     if role == "input_output":
         return f"PI/PO {node_id}"
-    gate = op_by_id.get(node_id, "")
-    gate_name = "AND" if gate == "&" else "OR" if gate == "|" else "NODE"
+    gate = node_kind_by_id.get(node_id, "")
+    if gate == "&":
+        gate_name = "AND"
+    elif gate == "|":
+        gate_name = "OR"
+    elif gate == "^":
+        gate_name = "XOR"
+    elif gate == "M":
+        gate_name = "MAJ"
+    elif gate == "-":
+        gate_name = "WIRE"
+    elif gate == "multi":
+        gate_name = f"NODE x{fanout_count_by_id.get(node_id, 0)}"
+    else:
+        gate_name = "NODE"
     if role == "output":
         return f"{gate_name} {node_id}\nPO"
     return f"{gate_name} {node_id}"
@@ -157,8 +182,9 @@ def visualize_dag(
     pis = set(pis_raw)
     pos = set(pos_raw)
 
-    op_by_id: dict[int, str] = {}
-    edges: list[tuple[int, int, int]] = []
+    node_kind_by_id: dict[int, str] = {}
+    fanout_count_by_id: dict[int, int] = {}
+    edge_set: set[tuple[int, int]] = set()
     node_ids = set(pis) | set(pos)
 
     level_by_id: dict[int, int] = {}
@@ -166,30 +192,54 @@ def visualize_dag(
         if not isinstance(node, dict):
             raise ValueError("Each node must be an object")
         node_id = node.get("id")
-        op = node.get("op")
         fanin = node.get("fanin")
+        fanout = node.get("fanout")
         node_level = node.get("level", 0)
 
         if not isinstance(node_id, int):
             raise ValueError("Each node must contain integer field 'id'")
-        if op not in ("&", "|"):
-            raise ValueError(f"Unsupported node operator for id {node_id}: {op}")
         if not isinstance(fanin, list):
             raise ValueError(f"Node {node_id} fanin must be a list")
+        if not isinstance(fanout, list) or not fanout:
+            raise ValueError(f"Node {node_id} fanout must be a non-empty list")
         if not isinstance(node_level, int):
             raise ValueError(f"Node {node_id} field 'level' must be an integer")
 
-        op_by_id[node_id] = op
+        fanout_ops: list[str] = []
+        for fanout_idx, fanout_entry in enumerate(fanout):
+            if not isinstance(fanout_entry, dict):
+                raise ValueError(
+                    f"Node {node_id} has invalid fanout entry at index {fanout_idx}"
+                )
+            op = fanout_entry.get("op")
+            if op not in ("&", "|", "^", "M", "-"):
+                raise ValueError(
+                    f"Unsupported node operator for id {node_id} fanout[{fanout_idx}]: {op}"
+                )
+            input_raw = fanout_entry.get("input")
+            invert_raw = fanout_entry.get("invert")
+            if not isinstance(input_raw, list) or not isinstance(invert_raw, list):
+                raise ValueError(
+                    f"Node {node_id} fanout[{fanout_idx}] must contain list fields 'input' and 'invert'"
+                )
+            if len(input_raw) != len(invert_raw):
+                raise ValueError(
+                    f"Node {node_id} fanout[{fanout_idx}] fields 'input' and 'invert' must have the same length"
+                )
+            fanout_ops.append(op)
+
+        node_kind_by_id[node_id] = fanout_ops[0] if len(fanout_ops) == 1 else "multi"
+        fanout_count_by_id[node_id] = len(fanout_ops)
         level_by_id[node_id] = node_level
         node_ids.add(node_id)
 
         for item in fanin:
             if not isinstance(item, list) or len(item) != 2:
                 raise ValueError(f"Node {node_id} has invalid fanin entry: {item}")
-            src, inv = item
-            if not isinstance(src, int) or inv not in (0, 1):
+            src, output_index = item
+            if not isinstance(src, int) or not isinstance(output_index, int) or output_index < 0:
                 raise ValueError(f"Node {node_id} has invalid fanin literal: {item}")
-            edges.append((src, node_id, inv))
+            edge_set.add((src, node_id))
             node_ids.add(src)
 
     for node_id in node_ids:
@@ -222,12 +272,12 @@ def visualize_dag(
 
     incoming_hidden: dict[int, int] = defaultdict(int)
     outgoing_hidden: dict[int, int] = defaultdict(int)
-    visible_edges: list[tuple[int, int, int]] = []
-    for src, dst, inv in edges:
+    visible_edges: list[tuple[int, int]] = []
+    for src, dst in sorted(edge_set):
         src_visible = src in visible_ids
         dst_visible = dst in visible_ids
         if src_visible and dst_visible:
-            visible_edges.append((src, dst, inv))
+            visible_edges.append((src, dst))
             continue
         if dst_visible and level_by_id[src] < range_start:
             incoming_hidden[dst] += 1
@@ -261,11 +311,9 @@ def visualize_dag(
                 color="#2C3E50",
             )
 
-    for src, dst, inv in visible_edges:
+    for src, dst in visible_edges:
         x0, y0 = pos_by_id[src]
         x1, y1 = pos_by_id[dst]
-        edge_color = "#2D3748" if inv == 0 else "#C0392B"
-        edge_style = "-" if inv == 0 else "--"
         ax.annotate(
             "",
             xy=(x1, y1),
@@ -273,8 +321,8 @@ def visualize_dag(
             arrowprops={
                 "arrowstyle": "->",
                 "linewidth": 1.2,
-                "color": edge_color,
-                "linestyle": edge_style,
+                "color": "#2D3748",
+                "linestyle": "-",
                 "alpha": 0.85,
                 "shrinkA": 15,
                 "shrinkB": 15,
@@ -350,7 +398,7 @@ def visualize_dag(
 
     marker_groups: dict[str, list[int]] = defaultdict(list)
     for node_id in visible_ids:
-        marker_groups[_node_marker(node_id, op_by_id, pis)].append(node_id)
+        marker_groups[_node_marker(node_id, node_kind_by_id, pis)].append(node_id)
 
     for marker, ids in marker_groups.items():
         xs = [pos_by_id[node_id][0] for node_id in ids]
@@ -372,7 +420,7 @@ def visualize_dag(
         ax.text(
             x,
             y,
-            _gate_label(node_id, op_by_id, pis, pos),
+            _gate_label(node_id, node_kind_by_id, fanout_count_by_id, pis, pos),
             ha="center",
             va="center",
             fontsize=8,
