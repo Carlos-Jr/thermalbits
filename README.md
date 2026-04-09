@@ -121,6 +121,30 @@ tb.visualize_dag(
 )
 ```
 
+#### Edge styling
+
+The renderer encodes extra information on the edges themselves:
+
+* **Dashed lines** mark inputs that are inverted by the consumer gate (the
+  destination node applies a `~` to that fanin before the operation).
+* **Colors** identify which fanout (output index) of the source node drives
+  the edge. This is only visible on nodes with more than one `fanout` entry,
+  since the Python parser always emits a single output per `assign`. The
+  palette cycles through:
+
+  | Source output index | Color |
+  |---|---|
+  | 0 | black |
+  | 1 | red |
+  | 2 | blue |
+  | 3 | green |
+  | 4 | purple |
+  | 5 | orange |
+  | 6 | cyan |
+  | 7 | brown |
+
+  Higher indices wrap around the same palette.
+
 The images below were generated using `test_files/simple.v`:
 
 **Horizontal (all levels):**
@@ -147,6 +171,52 @@ tb.visualize_dag(
     level_window=[1, 3],
 )
 ```
+
+To see the fanout color scheme in action, build a small circuit with a
+multi-output node by hand:
+
+```python
+from thermalbits import ThermalBits
+
+tb = ThermalBits()
+tb.file_name = "multi_output_example"
+tb.pi = [0, 1, 2]
+tb.po = [4, 5]
+tb.node = [
+    {
+        "id": 3,
+        "fanin": [[0, 0], [1, 0], [2, 0]],
+        "fanout": [
+            {"input": [0, 1], "invert": [0, 0], "op": "&"},
+            {"input": [0, 2], "invert": [1, 0], "op": "|"},
+            {"input": [1, 2], "invert": [0, 0], "op": "^"},
+        ],
+        "level": 1,
+        "suport": [0, 1, 2],
+    },
+    {
+        "id": 4,
+        "fanin": [[3, 0], [3, 1]],
+        "fanout": [{"input": [0, 1], "invert": [0, 0], "op": "&"}],
+        "level": 2,
+        "suport": [0, 1, 2],
+    },
+    {
+        "id": 5,
+        "fanin": [[3, 2], [0, 0]],
+        "fanout": [{"input": [0, 1], "invert": [0, 1], "op": "|"}],
+        "level": 2,
+        "suport": [0, 1, 2],
+    },
+]
+tb.visualize_dag(output_path="dag_multi_output_test.png", orientation="horizontal")
+```
+
+<img src="dag_multi_output_test.png" alt="Multi-output DAG showing fanout colors" width="520" />
+
+Note the black edge (output 0) and red edge (output 1) from node 3 into
+node 4, the blue edge (output 2) from node 3 into node 5, and the dashed
+edge from PI 0 into node 5 marking the inverted input.
 
 If necessary, install the visualization dependency:
 
