@@ -37,6 +37,24 @@ def _node_color(role: str) -> str:
     return "#C9CED4"
 
 
+_FANOUT_EDGE_COLORS = (
+    "#000000",  # fanout 0 -> black
+    "#D62728",  # fanout 1 -> red
+    "#1F77B4",  # fanout 2 -> blue
+    "#2CA02C",  # fanout 3 -> green
+    "#9467BD",  # fanout 4 -> purple
+    "#FF7F0E",  # fanout 5 -> orange
+    "#17BECF",  # fanout 6 -> cyan
+    "#8C564B",  # fanout 7 -> brown
+)
+
+
+def _fanout_color(output_index: int) -> str:
+    if output_index < 0:
+        output_index = 0
+    return _FANOUT_EDGE_COLORS[output_index % len(_FANOUT_EDGE_COLORS)]
+
+
 def _node_marker(node_id: int, node_kind_by_id: dict[int, str], pis: set[int]) -> str:
     if node_id in pis:
         return "o"
@@ -184,7 +202,7 @@ def visualize_dag(
 
     node_kind_by_id: dict[int, str] = {}
     fanout_count_by_id: dict[int, int] = {}
-    edge_set: set[tuple[int, int]] = set()
+    edge_set: set[tuple[int, int, int, bool]] = set()
     node_ids = set(pis) | set(pos)
 
     level_by_id: dict[int, int] = {}
@@ -206,6 +224,7 @@ def visualize_dag(
             raise ValueError(f"Node {node_id} field 'level' must be an integer")
 
         fanout_ops: list[str] = []
+        invert_by_fanin: dict[int, set[bool]] = defaultdict(set)
         for fanout_idx, fanout_entry in enumerate(fanout):
             if not isinstance(fanout_entry, dict):
                 raise ValueError(
@@ -226,6 +245,8 @@ def visualize_dag(
                 raise ValueError(
                     f"Node {node_id} fanout[{fanout_idx}] fields 'input' and 'invert' must have the same length"
                 )
+            for local_idx, inv in zip(input_raw, invert_raw):
+                invert_by_fanin[local_idx].add(bool(inv))
             fanout_ops.append(op)
 
         node_kind_by_id[node_id] = fanout_ops[0] if len(fanout_ops) == 1 else "multi"
@@ -233,13 +254,15 @@ def visualize_dag(
         level_by_id[node_id] = node_level
         node_ids.add(node_id)
 
-        for item in fanin:
+        for fanin_idx, item in enumerate(fanin):
             if not isinstance(item, list) or len(item) != 2:
                 raise ValueError(f"Node {node_id} has invalid fanin entry: {item}")
             src, output_index = item
             if not isinstance(src, int) or not isinstance(output_index, int) or output_index < 0:
                 raise ValueError(f"Node {node_id} has invalid fanin literal: {item}")
-            edge_set.add((src, node_id))
+            invert_variants = invert_by_fanin.get(fanin_idx) or {False}
+            for inverted in invert_variants:
+                edge_set.add((src, node_id, output_index, inverted))
             node_ids.add(src)
 
     for node_id in node_ids:
@@ -272,12 +295,12 @@ def visualize_dag(
 
     incoming_hidden: dict[int, int] = defaultdict(int)
     outgoing_hidden: dict[int, int] = defaultdict(int)
-    visible_edges: list[tuple[int, int]] = []
-    for src, dst in sorted(edge_set):
+    visible_edges: list[tuple[int, int, int, bool]] = []
+    for src, dst, out_idx, inverted in sorted(edge_set):
         src_visible = src in visible_ids
         dst_visible = dst in visible_ids
         if src_visible and dst_visible:
-            visible_edges.append((src, dst))
+            visible_edges.append((src, dst, out_idx, inverted))
             continue
         if dst_visible and level_by_id[src] < range_start:
             incoming_hidden[dst] += 1
@@ -311,7 +334,7 @@ def visualize_dag(
                 color="#2C3E50",
             )
 
-    for src, dst in visible_edges:
+    for src, dst, out_idx, inverted in visible_edges:
         x0, y0 = pos_by_id[src]
         x1, y1 = pos_by_id[dst]
         ax.annotate(
@@ -321,8 +344,8 @@ def visualize_dag(
             arrowprops={
                 "arrowstyle": "->",
                 "linewidth": 1.2,
-                "color": "#2D3748",
-                "linestyle": "-",
+                "color": _fanout_color(out_idx),
+                "linestyle": "--" if inverted else "-",
                 "alpha": 0.85,
                 "shrinkA": 15,
                 "shrinkB": 15,
