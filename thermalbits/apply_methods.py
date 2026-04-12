@@ -13,11 +13,11 @@ DEPTH_ORIENTED = "depth_oriented"
 ENERGY_ORIENTED = "energy_oriented"
 
 _SUPPORTED_OPS = {"&", "|", "^", "M", "-"}
-_FORWARD_LIMIT = 2
 
 Overview = dict[str, object]
 Node = dict[str, object]
 NodeLookup = dict[int, Node]
+SourceRef = tuple[int, int]
 SelectionPolicy = Callable[[list[int]], list[int]]
 Transformation = Callable[[Overview], Overview]
 
@@ -114,11 +114,6 @@ def _node_level(node: Node) -> int:
     return level
 
 
-def _wire_fanout_count(node: Node) -> int:
-    """Count wire (op='-') fanout entries on a node."""
-    return sum(1 for entry in node.get("fanout", []) if entry.get("op") == "-")
-
-
 def _build_node_lookup(nodes_raw: object) -> NodeLookup:
     """Validate the node list and return nodes indexed by id."""
 
@@ -161,38 +156,67 @@ def _state_overview_like(self) -> Overview:
     return deepcopy(_state_overview(self))
 
 
-def _build_children_index(nodes: list[Node], node_by_id: NodeLookup) -> dict[int, list[int]]:
-    """Map each node id to the ids of internal nodes that consume it via non-wire fanouts.
+def _source_level(source_ref: SourceRef, node_by_id: NodeLookup) -> int:
+    """Return the topological level of a source signal."""
+
+    source_id, _output_index = source_ref
+    source_node = node_by_id.get(source_id)
+    if source_node is None:
+        return 0
+    return _node_level(source_node)
+
+
+def _source_refs(pis: list[int], node_by_id: NodeLookup) -> list[SourceRef]:
+    """Return PI outputs and non-wire node outputs that may feed chains."""
+
+    refs: list[SourceRef] = [(pi_id, 0) for pi_id in pis]
+    for node_id in sorted(node_by_id):
+        for output_index, fanout_entry in enumerate(_fanout_list(node_by_id[node_id])):
+            if fanout_entry.get("op") != "-":
+                refs.append((node_id, output_index))
+    return refs
+
+
+def _build_children_index(
+    nodes: list[Node],
+    pis: list[int],
+    node_by_id: NodeLookup,
+) -> dict[SourceRef, list[int]]:
+    """Map each source signal to the internal nodes that consume it.
 
     Connections through wire (op='-') fanouts represent forwarded signals and
     are excluded, matching the reference algorithm's 'ignore forward edges'.
+    Primary outputs in this schema are regular node ids, so they remain eligible
+    as children.
     """
 
-    node_ids = {int(node["id"]) for node in nodes}
-    children: dict[int, set[int]] = {node_id: set() for node_id in node_ids}
+    valid_sources = set(_source_refs(pis, node_by_id))
+    children: dict[SourceRef, set[int]] = {
+        source_ref: set() for source_ref in valid_sources
+    }
 
     for node in nodes:
         child_id = int(node["id"])
         for source_id, output_index in _fanin_list(node):
-            if source_id not in node_ids:
-                continue
-            source_fanouts = node_by_id[source_id].get("fanout", [])
-            if output_index < len(source_fanouts) and source_fanouts[output_index].get("op") == "-":
-                continue
-            children[source_id].add(child_id)
+            source_ref = (source_id, output_index)
+            if source_ref in valid_sources:
+                children[source_ref].add(child_id)
 
-    return {node_id: sorted(children[node_id]) for node_id in sorted(children)}
+    return {
+        source_ref: sorted(children[source_ref])
+        for source_ref in sorted(children)
+    }
 
 
 def _ranked_children(
-    node_id: int,
-    children_index: dict[int, list[int]],
+    source_ref: SourceRef,
+    children_index: dict[SourceRef, list[int]],
     node_by_id: NodeLookup,
 ) -> list[tuple[int, list[int]]]:
     """Group direct children by level in ascending order."""
 
     grouped: dict[int, list[int]] = defaultdict(list)
-    for child_id in children_index.get(node_id, []):
+    for child_id in children_index.get(source_ref, []):
         grouped[_node_level(node_by_id[child_id])].append(child_id)
     return [
         (level, sorted(grouped[level]))
@@ -202,16 +226,15 @@ def _ranked_children(
 
 def _choose(
     grouped_children: list[int],
-    outputs: set[int],
-    node_by_id: NodeLookup,
+    used_children: set[int],
     policy: SelectionPolicy,
 ) -> list[int]:
-    """Filter terminal/full nodes and delegate the final selection to the method policy."""
+    """Filter already-used children and delegate final selection to the policy."""
 
     valid_children = [
         child_id
         for child_id in grouped_children
-        if child_id not in outputs and _wire_fanout_count(node_by_id[child_id]) < _FORWARD_LIMIT
+        if child_id not in used_children
     ]
     return policy(valid_children)
 
@@ -228,6 +251,7 @@ def _add_wire_fanout(node: Node, local_fanin_idx: int) -> int:
             and entry.get("invert") == [0]
         ):
             return i
+
     new_idx = len(node["fanout"])
     node["fanout"].append({"op": "-", "input": [local_fanin_idx], "invert": [0]})
     return new_idx
@@ -263,27 +287,26 @@ def _normalize_node_fanin(node: Node) -> None:
 
 
 def _make_chain(
-    node_id: int,
+    source_ref: SourceRef,
     choices: list[int],
-    outputs: set[int],
     node_by_id: NodeLookup,
-) -> None:
+) -> bool:
     """
-    Constroi uma cadeia de fanouts a partir de node_id.
+    Constroi uma cadeia de fanouts a partir de source_ref.
 
-    choices[0] mantem a ligacao direta com node_id.
+    choices[0] mantem a ligacao direta com source_ref.
     Para cada choices[i] (i >= 1): adiciona um fanout WIRE em choices[i-1]
-    que repassa o sinal de node_id, e recabeia choices[i] para ler desse WIRE.
-    Os outputs sao recabeados para o ultimo WIRE da cadeia.
+    que repassa o sinal de source_ref, e recabeia choices[i] para ler desse WIRE.
 
     carry_fanin_idx rastreia, em cada passo, qual indice LOCAL no no anterior
-    carrega o sinal repassado de node_id.
+    carrega o sinal repassado de source_ref.
     """
     if not choices:
-        return
+        return False
 
-    previous_id = node_id
-    # indice local no `previous_id` que carrega o sinal de node_id
+    changed = False
+    previous_id: int | None = None
+    # indice local no `previous_id` que carrega o sinal de source_ref
     carry_fanin_idx: int | None = None
 
     for index, child_id in enumerate(choices):
@@ -291,26 +314,27 @@ def _make_chain(
         child_fanin = _fanin_list(child_node)
 
         if index == 0:
-            # choices[0] le node_id diretamente; apenas localiza o indice de carry.
+            # choices[0] le source_ref diretamente; apenas localiza o indice de carry.
             for k, (src, _out) in enumerate(child_fanin):
-                if src == node_id:
+                if (src, _out) == source_ref:
                     carry_fanin_idx = k
                     break
         else:
-            if carry_fanin_idx is None:
+            if previous_id is None or carry_fanin_idx is None:
                 previous_id = child_id
                 continue
 
             prev_node = node_by_id[previous_id]
 
-            # Adiciona WIRE no no anterior que repassa o sinal de node_id.
+            # Adiciona WIRE no no anterior que repassa o sinal de source_ref.
             wire_idx = _add_wire_fanout(prev_node, carry_fanin_idx)
 
-            # Recabeia child: todas as entradas [node_id, *] → [previous_id, wire_idx].
+            # Recabeia child: entradas source_ref → [previous_id, wire_idx].
             for ref in child_fanin:
-                if ref[0] == node_id:
+                if (ref[0], ref[1]) == source_ref:
                     ref[0] = previous_id
                     ref[1] = wire_idx
+                    changed = True
 
             _normalize_node_fanin(child_node)
 
@@ -323,29 +347,7 @@ def _make_chain(
                     break
 
         previous_id = child_id
-
-    # Recabeia os outputs para o ultimo WIRE da cadeia.
-    last_choice_id = choices[-1]
-    last_choice_node = node_by_id[last_choice_id]
-
-    for output_id in sorted(
-        outputs,
-        key=lambda oid: (_node_level(node_by_id[oid]), oid),
-    ):
-        output_node = node_by_id[output_id]
-        output_fanin = _fanin_list(output_node)
-
-        if carry_fanin_idx is None or not any(src == node_id for src, _ in output_fanin):
-            continue
-
-        wire_idx = _add_wire_fanout(last_choice_node, carry_fanin_idx)
-
-        for ref in output_fanin:
-            if ref[0] == node_id:
-                ref[0] = last_choice_id
-                ref[1] = wire_idx
-
-        _normalize_node_fanin(output_node)
+    return changed
 
 
 def _recompute_levels_and_support(nodes: list[Node], pis: list[int]) -> None:
@@ -426,7 +428,18 @@ def _select_energy_oriented(valid_children: list[int]) -> list[int]:
     return list(valid_children)
 
 
-def _build_chain(overview: Overview, policy: SelectionPolicy) -> Overview:
+def _current_depth(nodes: list[Node]) -> int:
+    """Return the current maximum node level."""
+
+    return max((_node_level(node) for node in nodes), default=0)
+
+
+def _build_chain(
+    overview: Overview,
+    policy: SelectionPolicy,
+    *,
+    preserve_depth: bool,
+) -> Overview:
     """Apply a chain-building policy over the whole circuit."""
 
     pis = _require_int_list("pis", overview.get("pis"))
@@ -443,21 +456,31 @@ def _build_chain(overview: Overview, policy: SelectionPolicy) -> Overview:
             raise ValueError(f"Overview output id has no source signal: {output_id}")
 
     nodes = list(node_by_id.values())
-    po_set = set(pos)
-    ordered_node_ids = sorted(node_by_id, key=lambda current_id: (_node_level(node_by_id[current_id]), current_id))
+    max_allowed_depth = _current_depth(nodes) if preserve_depth else None
+    ordered_source_refs = sorted(
+        _source_refs(pis, node_by_id),
+        key=lambda source_ref: (
+            _source_level(source_ref, node_by_id),
+            source_ref[0],
+            source_ref[1],
+        ),
+        reverse=True,
+    )
 
-    for node_id in ordered_node_ids:
+    for source_ref in ordered_source_refs:
+        used_children: set[int] = set()
+
         while True:
             _recompute_levels_and_support(nodes, pis)
-            children_index = _build_children_index(nodes, node_by_id)
-            outputs = {
-                child_id
-                for child_id in children_index.get(node_id, [])
-                if child_id in po_set
-            }
+            node_by_id = _build_node_lookup(nodes)
+            children_index = _build_children_index(nodes, pis, node_by_id)
             choices: list[int] = []
-            for _level, grouped_children in _ranked_children(node_id, children_index, node_by_id):
-                choices.extend(_choose(grouped_children, outputs, node_by_id, policy))
+            for _level, grouped_children in _ranked_children(
+                source_ref,
+                children_index,
+                node_by_id,
+            ):
+                choices.extend(_choose(grouped_children, used_children, policy))
 
             ordered_choices = sorted(
                 set(choices),
@@ -466,7 +489,21 @@ def _build_chain(overview: Overview, policy: SelectionPolicy) -> Overview:
             if len(ordered_choices) <= 1:
                 break
 
-            _make_chain(node_id, ordered_choices, outputs, node_by_id)
+            snapshot = deepcopy(nodes) if max_allowed_depth is not None else None
+            changed = _make_chain(source_ref, ordered_choices, node_by_id)
+            if not changed:
+                used_children.update(ordered_choices)
+                break
+
+            _recompute_levels_and_support(nodes, pis)
+            if max_allowed_depth is not None and _current_depth(nodes) > max_allowed_depth:
+                if snapshot is None:
+                    raise AssertionError("missing snapshot for depth-preserving rollback")
+                nodes[:] = snapshot
+                node_by_id = _build_node_lookup(nodes)
+                break
+
+            used_children.update(ordered_choices)
 
     _recompute_levels_and_support(nodes, pis)
     overview["nodes"] = nodes
@@ -476,13 +513,13 @@ def _build_chain(overview: Overview, policy: SelectionPolicy) -> Overview:
 def _apply_depth_oriented(overview: Overview) -> Overview:
     """Apply the depth-oriented chain selection policy."""
 
-    return _build_chain(overview, _select_depth_oriented)
+    return _build_chain(overview, _select_depth_oriented, preserve_depth=True)
 
 
 def _apply_energy_oriented(overview: Overview) -> Overview:
     """Apply the energy-oriented chain selection policy."""
 
-    return _build_chain(overview, _select_energy_oriented)
+    return _build_chain(overview, _select_energy_oriented, preserve_depth=False)
 
 
 METHOD_REGISTRY: dict[str, Transformation] = {

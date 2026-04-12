@@ -34,6 +34,7 @@ Artifacts will be created in `dist/`.
 * [x] Generate Verilog from the current circuit state.
 * [x] Visualize the circuit as a DAG image.
 * [x] Create blank circuit objects and deep-copy existing ones.
+* [x] Apply depth-oriented and energy-oriented fanout-chain transformations.
 * [x] Compute total circuit Shannon entropy (Landauer information loss per gate).
 
 ## Usage Examples
@@ -105,6 +106,54 @@ The `out.json` file contains:
 * `suport`: PI cone of the node (integer IDs).
 
 
+
+### Apply Energy-Recovery Methods
+
+`apply()` transforms the current circuit in memory using one of the available
+fanout-chain methods. The implemented methods are based on the EO and DO
+algorithms described in:
+
+CHAVES, Jeferson F. et al. Enhancing fundamental energy limits of
+field-coupled nanocomputing circuits. In: 2018 IEEE International Symposium on
+Circuits and Systems (ISCAS). IEEE, 2018. p. 1-5.
+
+Available methods:
+
+| Constant | Method | Goal |
+|---|---|---|
+| `DEPTH_ORIENTED` | Depth-oriented / Delay-oriented (DO) | Reduce energy while preserving the original circuit depth. It selects at most one child per rank when building fanout chains. |
+| `ENERGY_ORIENTED` | Energy-oriented (EO) | Maximize energy reduction. It can serialize multiple children in the same rank and may increase circuit depth. |
+
+Basic usage:
+
+```python
+from thermalbits import DEPTH_ORIENTED, ENERGY_ORIENTED, ThermalBits
+
+tb = ThermalBits("netlist.v")
+
+depth_tb = tb.copy().apply(DEPTH_ORIENTED)
+energy_tb = tb.copy().apply(ENERGY_ORIENTED)
+
+depth_tb.write_json("netlist_depth_oriented.json")
+energy_tb.write_json("netlist_energy_oriented.json")
+```
+
+`apply()` mutates the object and returns the same instance, so it can be
+chained with other calls. Use `copy()` first when you want to preserve the
+original circuit:
+
+```python
+from thermalbits import ENERGY_ORIENTED, ThermalBits
+
+tb = ThermalBits("netlist.v")
+transformed = tb.copy().apply(ENERGY_ORIENTED)
+
+original_entropy = tb.update_entropy(chunks=None)
+transformed_entropy = transformed.update_entropy(chunks=None)
+
+print(original_entropy)
+print(transformed_entropy)
+```
 
 ### Visualize Graph
 

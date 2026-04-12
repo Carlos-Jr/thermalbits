@@ -81,9 +81,12 @@ def test_half_adder_depth_and_energy_visual_entropy(
     assert depth_entropy == pytest.approx(depth_tb.entropy, abs=1e-6)
     assert energy_entropy == pytest.approx(energy_tb.entropy, abs=1e-6)
 
-    assert depth_tb.node == original_tb.node
+    assert depth_tb.node != original_tb.node
     assert energy_tb.node != original_tb.node
+    assert dep_depth == orig_depth
+    assert ene_depth > orig_depth
 
     assert original_entropy == pytest.approx(3.76, abs=1e-2)
-    assert depth_entropy == pytest.approx(original_entropy, abs=1e-6)
-    assert energy_entropy == pytest.approx(3.07, abs=1e-2)
+    assert depth_entropy == pytest.approx(1.88, abs=1e-2)
+    assert energy_entropy == pytest.approx(0.69, abs=1e-2)
+    assert energy_entropy < depth_entropy < original_entropy
