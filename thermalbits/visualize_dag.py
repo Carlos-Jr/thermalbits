@@ -153,6 +153,76 @@ def _build_positions(
     return pos, axis_by_level, (x_min, x_max, y_min, y_max)
 
 
+def _long_range_rad(
+    src: int,
+    dst: int,
+    level_by_id: dict[int, int],
+    pos_by_id: dict[int, tuple[float, float]],
+    grouped_levels: list[tuple[int, list[int]]],
+    orientation: str,
+    clearance: float = 0.8,
+) -> float:
+    """
+    Returns an arc3 curvature (rad) for edges that skip multiple levels so they
+    route above or below the intermediate-level nodes instead of passing through them.
+
+    For arc3, the perpendicular displacement at the midpoint ≈ rad * dist / 2, so
+        rad = 2 * required_deflection / dist.
+
+    The sign follows matplotlib's arc3 convention:
+      - horizontal layout (arrow goes +x): rad > 0 → curves upward (+y)
+      - vertical layout   (arrow goes -y): rad > 0 → curves rightward (+x)
+    """
+    src_level = level_by_id[src]
+    dst_level = level_by_id[dst]
+
+    if abs(dst_level - src_level) <= 1:
+        return 0.0
+
+    x0, y0 = pos_by_id[src]
+    x1, y1 = pos_by_id[dst]
+
+    min_level = min(src_level, dst_level)
+    max_level = max(src_level, dst_level)
+
+    if orientation == "horizontal":
+        get_trans = lambda nid: pos_by_id[nid][1]
+        trans_mid = (y0 + y1) / 2.0
+    else:
+        get_trans = lambda nid: pos_by_id[nid][0]
+        trans_mid = (x0 + x1) / 2.0
+
+    intermediate_trans = [
+        get_trans(nid)
+        for level, nodes in grouped_levels
+        if min_level < level < max_level
+        for nid in nodes
+    ]
+
+    if not intermediate_trans:
+        return 0.0
+
+    trans_max = max(intermediate_trans)
+    trans_min = min(intermediate_trans)
+
+    # Edge midpoint is already clear of all intermediate nodes — no correction needed.
+    if trans_mid > trans_max + clearance or trans_mid < trans_min - clearance:
+        return 0.0
+
+    dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+    if dist < 1e-6:
+        return 0.0
+
+    # Deflection needed to clear above (+) vs below (−) the intermediate cluster.
+    deflect_pos = (trans_max + clearance) - trans_mid
+    deflect_neg = (trans_min - clearance) - trans_mid
+
+    deflection = deflect_pos if abs(deflect_pos) <= abs(deflect_neg) else deflect_neg
+
+    rad = 2.0 * deflection / dist
+    return max(-0.45, min(0.45, rad))
+
+
 def visualize_dag(
     self,
     output_path: str,
@@ -334,23 +404,37 @@ def visualize_dag(
                 color="#2C3E50",
             )
 
-    for src, dst, out_idx, inverted in visible_edges:
+    parallel_groups: dict[tuple[int, int], list[tuple[int, int, int, bool]]] = defaultdict(list)
+    for edge in visible_edges:
+        src, dst, out_idx, inverted = edge
+        parallel_groups[(src, dst)].append(edge)
+
+    for (src, dst), group_edges in parallel_groups.items():
+        n = len(group_edges)
+        rad_step = 0.25
+        parallel_rads = [rad_step * (i - (n - 1) / 2.0) for i in range(n)]
+
+        lr_rad = _long_range_rad(src, dst, level_by_id, pos_by_id, grouped, orientation)
+
         x0, y0 = pos_by_id[src]
         x1, y1 = pos_by_id[dst]
-        ax.annotate(
-            "",
-            xy=(x1, y1),
-            xytext=(x0, y0),
-            arrowprops={
-                "arrowstyle": "->",
-                "linewidth": 1.2,
-                "color": _fanout_color(out_idx),
-                "linestyle": "--" if inverted else "-",
-                "alpha": 0.85,
-                "shrinkA": 15,
-                "shrinkB": 15,
-            },
-        )
+        for (_, _, out_idx, inverted), p_rad in zip(group_edges, parallel_rads):
+            total_rad = lr_rad + p_rad
+            ax.annotate(
+                "",
+                xy=(x1, y1),
+                xytext=(x0, y0),
+                arrowprops={
+                    "arrowstyle": "->",
+                    "linewidth": 1.2,
+                    "color": _fanout_color(out_idx),
+                    "linestyle": "--" if inverted else "-",
+                    "alpha": 0.85,
+                    "shrinkA": 15,
+                    "shrinkB": 15,
+                    "connectionstyle": f"arc3,rad={total_rad:.3f}",
+                },
+            )
 
     if orientation == "horizontal":
         left_stub_x = x_min + 0.4

@@ -1,3 +1,4 @@
+from .apply_methods import apply
 from .copy_methods import copy_thermalbits, deepcopy_dunder
 from ._init_method import init_thermalbits
 from .generate_overview import generate_overview, write_json
@@ -16,3 +17,4 @@ class ThermalBits:
     write_verilog = write_verilog
     visualize_dag = visualize_dag
     update_entropy = update_entropy
+    apply = apply

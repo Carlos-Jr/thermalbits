@@ -1,10 +1,10 @@
 //! Objetivo: concentrar metricas estatisticas calculadas sobre a simulacao.
-//! Entradas: contagens acumuladas por gate (`GateResult`).
+//! Entradas: contagens acumuladas por node (`NodeResult`).
 //! Saidas: entropia local e entropia total do circuito.
 
 use rayon::prelude::*;
 
-use crate::sim::shared::GateResult;
+use crate::sim::shared::NodeResult;
 
 pub fn entropy(counts: &[u64]) -> f64 {
     let total: u64 = counts.iter().sum();
@@ -22,13 +22,13 @@ pub fn entropy(counts: &[u64]) -> f64 {
     h
 }
 
-pub fn total_entropy(results: &[GateResult]) -> f64 {
+pub fn total_entropy(results: &[NodeResult]) -> f64 {
     results
         .par_iter()
         .map(|r| {
-            let h_ab = entropy(&r.joint_counts);
-            let h_y = entropy(&[r.total - r.pop_y, r.pop_y]);
-            h_ab - h_y
+            let h_in = entropy(&r.input_joint);
+            let h_out = entropy(&r.output_joint);
+            h_in - h_out
         })
         .sum()
 }

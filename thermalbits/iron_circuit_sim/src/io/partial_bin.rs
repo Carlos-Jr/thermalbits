@@ -1,60 +1,39 @@
 //! Objetivo: ler, escrever e combinar arquivos parciais binarios da simulacao chunk.
-//! Entradas: `GateResult`, metadados do circuito e caminhos de arquivos `.bin`.
+//! Entradas: `NodeResult`, metadados do circuito e caminhos de arquivos `.bin`.
 //! Saidas: partials persistidos e resultados agregados validados para merge do circuito inteiro.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 
-use crate::circuit::Op;
-use crate::sim::shared::GateResult;
+use crate::sim::shared::NodeResult;
 
 struct PartialData {
     circuit_hash: u64,
     n_pis: u32,
     start: u64,
     count: u64,
-    records: Vec<GateResult>,
+    records: Vec<NodeResult>,
 }
 
-fn op_to_byte(op: Op) -> u8 {
-    match op {
-        Op::And => 0,
-        Op::Or => 1,
-        Op::Xor => 2,
-        Op::Majority => 3,
-        Op::Wire => 4,
-    }
-}
-
-fn byte_to_op(b: u8) -> Op {
-    match b {
-        0 => Op::And,
-        1 => Op::Or,
-        2 => Op::Xor,
-        3 => Op::Majority,
-        4 => Op::Wire,
-        _ => panic!("Unknown op byte {} in partial file", b),
-    }
-}
-
-/// Binary format v3:
+/// Binary format v4:
 /// Header: magic(4) + version(1) + flags(1) + n_pis(4) + start(8) + count(8)
 ///         + circuit_hash(8) + n_records(4) = 38 bytes
-/// Record: gate_id(4) + output_index(4) + op(1) + n_jc(2) + pop_y(8) + joint_counts(8 × n_jc)
+/// Record: gate_id(4) + n_inputs(2) + n_outputs(2)
+///         + input_joint(8 × 2^n_inputs) + output_joint(8 × 2^n_outputs)
 pub fn write_partial_bin(
     path: &str,
     circuit_hash: u64,
     n_pis: u32,
     start: u64,
     count: u64,
-    results: &[GateResult],
+    results: &[NodeResult],
 ) -> std::io::Result<()> {
     let f = File::create(path)?;
     let mut w = BufWriter::new(f);
 
     w.write_all(b"CSIM")?;
-    w.write_all(&[3u8, 1u8])?;
+    w.write_all(&[4u8, 1u8])?;
     w.write_all(&n_pis.to_le_bytes())?;
     w.write_all(&start.to_le_bytes())?;
     w.write_all(&count.to_le_bytes())?;
@@ -63,12 +42,13 @@ pub fn write_partial_bin(
 
     for r in results {
         w.write_all(&r.gate_id.to_le_bytes())?;
-        w.write_all(&r.output_index.to_le_bytes())?;
-        w.write_all(&[op_to_byte(r.op)])?;
-        w.write_all(&(r.joint_counts.len() as u16).to_le_bytes())?;
-        w.write_all(&r.pop_y.to_le_bytes())?;
-        for &jc in &r.joint_counts {
-            w.write_all(&jc.to_le_bytes())?;
+        w.write_all(&(r.n_inputs as u16).to_le_bytes())?;
+        w.write_all(&(r.n_outputs as u16).to_le_bytes())?;
+        for &v in &r.input_joint {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        for &v in &r.output_joint {
+            w.write_all(&v.to_le_bytes())?;
         }
     }
 
@@ -107,8 +87,8 @@ fn read_partial_bin(path: &str) -> std::io::Result<PartialData> {
     assert_eq!(magic, b"CSIM", "Invalid magic — not a CSIM partial file");
     let version = take!(1)[0];
     assert_eq!(
-        version, 3,
-        "Unsupported CSIM version {} (expected 3)",
+        version, 4,
+        "Unsupported CSIM version {} (expected 4)",
         version
     );
     let _flags = take!(1)[0];
@@ -122,22 +102,25 @@ fn read_partial_bin(path: &str) -> std::io::Result<PartialData> {
     let mut records = Vec::with_capacity(n_records);
     for _ in 0..n_records {
         let gate_id = u32le!();
-        let output_index = u32le!();
-        let op = byte_to_op(take!(1)[0]);
-        let n_jc = u16le!() as usize;
-        let pop_y = u64le!();
-        let mut joint_counts = Vec::with_capacity(n_jc);
-        for _ in 0..n_jc {
-            joint_counts.push(u64le!());
+        let n_inputs = u16le!() as usize;
+        let n_outputs = u16le!() as usize;
+        let n_ij = 1usize << n_inputs;
+        let n_oj = 1usize << n_outputs;
+        let mut input_joint = Vec::with_capacity(n_ij);
+        for _ in 0..n_ij {
+            input_joint.push(u64le!());
         }
-        records.push(GateResult {
+        let mut output_joint = Vec::with_capacity(n_oj);
+        for _ in 0..n_oj {
+            output_joint.push(u64le!());
+        }
+        records.push(NodeResult {
             gate_id,
-            output_index,
-            op,
-            support_len: 0,
+            n_inputs,
+            n_outputs,
             total: count,
-            joint_counts,
-            pop_y,
+            input_joint,
+            output_joint,
         });
     }
 
@@ -150,7 +133,7 @@ fn read_partial_bin(path: &str) -> std::io::Result<PartialData> {
     })
 }
 
-pub fn merge_partials(paths: &[String]) -> Vec<GateResult> {
+pub fn merge_partials(paths: &[String]) -> Vec<NodeResult> {
     assert!(!paths.is_empty(), "No partial files to merge");
 
     let first = read_partial_bin(&paths[0]).expect("Cannot read partial file");
@@ -193,39 +176,38 @@ pub fn merge_partials(paths: &[String]) -> Vec<GateResult> {
         );
     }
 
-    let mut acc: HashMap<(u32, u32), GateResult> = HashMap::new();
+    let mut acc: HashMap<u32, NodeResult> = HashMap::new();
     let mut total_count: u64 = 0;
 
     for pd in all_data {
         total_count += pd.count;
 
         for r in pd.records {
-            let key = (r.gate_id, r.output_index);
-            let n_jc = r.joint_counts.len();
-            let e = acc.entry(key).or_insert(GateResult {
+            let e = acc.entry(r.gate_id).or_insert(NodeResult {
                 gate_id: r.gate_id,
-                output_index: r.output_index,
-                op: r.op,
-                support_len: 0,
+                n_inputs: r.n_inputs,
+                n_outputs: r.n_outputs,
                 total: 0,
-                joint_counts: vec![0u64; n_jc],
-                pop_y: 0,
+                input_joint: vec![0u64; r.input_joint.len()],
+                output_joint: vec![0u64; r.output_joint.len()],
             });
-            for (dst, &src) in e.joint_counts.iter_mut().zip(r.joint_counts.iter()) {
+            for (dst, &src) in e.input_joint.iter_mut().zip(r.input_joint.iter()) {
                 *dst += src;
             }
-            e.pop_y += r.pop_y;
+            for (dst, &src) in e.output_joint.iter_mut().zip(r.output_joint.iter()) {
+                *dst += src;
+            }
         }
     }
 
-    let mut results: Vec<GateResult> = acc.into_values().collect();
+    let mut results: Vec<NodeResult> = acc.into_values().collect();
     for r in &mut results {
         r.total = total_count;
     }
-    results.sort_by_key(|r| (r.gate_id, r.output_index));
+    results.sort_by_key(|r| r.gate_id);
 
     eprintln!(
-        "Merged {} partial files — {} outputs, total vectors: {}",
+        "Merged {} partial files — {} nodes, total vectors: {}",
         paths.len(),
         results.len(),
         total_count

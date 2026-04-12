@@ -1,14 +1,14 @@
 //! Objetivo: executar a simulacao chunk com bitsets globais por fatia da tabela-verdade.
 //! Entradas: `Circuit` inteiro, `start` e `count` da janela simulada.
-//! Saidas: `Vec<GateResult>` com contagens acumuladas para todas as gates/outputs na faixa.
+//! Saidas: `Vec<NodeResult>` com contagens acumuladas para todas as nodes na faixa.
 
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::circuit::Circuit;
 use crate::sim::shared::{
-    compute_gate_refcounts, eval_output_words, last_word_mask_from_total, release_refcount,
-    GateResult,
+    compute_gate_refcounts, compute_joint_counts, eval_output_words, last_word_mask_from_total,
+    release_refcount, NodeResult,
 };
 
 const STANDARD_PI_WORDS: [u64; 6] = [
@@ -53,7 +53,7 @@ fn resolve_fanin_sig<'a>(
     }
 }
 
-pub fn simulate_chunk(circuit: &Circuit, start: u64, count: u64) -> Vec<GateResult> {
+pub fn simulate_chunk(circuit: &Circuit, start: u64, count: u64) -> Vec<NodeResult> {
     assert!(count > 0, "count must be > 0");
     assert!(
         circuit.pis.len() <= 64,
@@ -107,7 +107,7 @@ pub fn simulate_chunk(circuit: &Circuit, start: u64, count: u64) -> Vec<GateResu
 
     let refcounts = compute_gate_refcounts(circuit);
     let mut sig_store: HashMap<u32, Vec<Vec<u64>>> = HashMap::new();
-    let mut results: Vec<GateResult> = Vec::new();
+    let mut results: Vec<NodeResult> = Vec::new();
 
     for level in 1..=circuit.max_level {
         let Some(gate_ids) = circuit.levels.get(&level) else {
@@ -116,7 +116,7 @@ pub fn simulate_chunk(circuit: &Circuit, start: u64, count: u64) -> Vec<GateResu
 
         let gates_here: Vec<_> = gate_ids.iter().map(|id| &circuit.gates[id]).collect();
 
-        let computed: Vec<(u32, Vec<(Vec<u64>, Option<(Vec<u64>, u64)>)>)> = gates_here
+        let computed: Vec<(u32, Vec<Vec<u64>>, NodeResult)> = gates_here
             .par_iter()
             .map(|g| {
                 // Resolve all fanin signals.
@@ -129,7 +129,7 @@ pub fn simulate_chunk(circuit: &Circuit, start: u64, count: u64) -> Vec<GateResu
                     .collect();
 
                 // Evaluate each fanout entry.
-                let output_results: Vec<(Vec<u64>, Option<(Vec<u64>, u64)>)> = g
+                let output_tts: Vec<Vec<u64>> = g
                     .fanout
                     .iter()
                     .map(|fo| {
@@ -139,34 +139,35 @@ pub fn simulate_chunk(circuit: &Circuit, start: u64, count: u64) -> Vec<GateResu
                             .enumerate()
                             .map(|(i, &idx)| (fanin_sigs[idx], fo.invert[i]))
                             .collect();
-                        eval_output_words(&inputs, fo.op, count, true)
+                        eval_output_words(&inputs, fo.op, count)
                     })
                     .collect();
 
-                (g.id, output_results)
+                // Compute input joint distribution.
+                let input_joint = compute_joint_counts(&fanin_sigs, n_words, count);
+
+                // Compute output joint distribution.
+                let output_refs: Vec<&[u64]> =
+                    output_tts.iter().map(|t| t.as_slice()).collect();
+                let output_joint = compute_joint_counts(&output_refs, n_words, count);
+
+                let result = NodeResult {
+                    gate_id: g.id,
+                    n_inputs: fanin_sigs.len(),
+                    n_outputs: output_tts.len(),
+                    total: count,
+                    input_joint,
+                    output_joint,
+                };
+
+                (g.id, output_tts, result)
             })
             .collect();
 
-        for (gid, output_results) in computed {
+        for (gid, output_tts, node_result) in computed {
             let g = &circuit.gates[&gid];
-            let mut output_sigs = Vec::with_capacity(output_results.len());
-
-            for (fo_idx, (out_sig, maybe_counts)) in output_results.into_iter().enumerate() {
-                if let Some((joint_counts, pop_y)) = maybe_counts {
-                    results.push(GateResult {
-                        gate_id: gid,
-                        output_index: fo_idx as u32,
-                        op: g.fanout[fo_idx].op,
-                        support_len: g.support.len(),
-                        total: count,
-                        joint_counts,
-                        pop_y,
-                    });
-                }
-                output_sigs.push(out_sig);
-            }
-
-            sig_store.insert(gid, output_sigs);
+            results.push(node_result);
+            sig_store.insert(gid, output_tts);
 
             for &(src_id, _) in &g.fanin {
                 if release_refcount(&refcounts, src_id) {
@@ -180,6 +181,6 @@ pub fn simulate_chunk(circuit: &Circuit, start: u64, count: u64) -> Vec<GateResu
         }
     }
 
-    results.sort_by_key(|r| (r.gate_id, r.output_index));
+    results.sort_by_key(|r| r.gate_id);
     results
 }

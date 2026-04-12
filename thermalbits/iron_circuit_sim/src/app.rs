@@ -93,7 +93,7 @@ fn run_sim(args: SimArgs) {
     write_counts_file(&args.output, circuit.pis.len(), &results).expect("Failed to write output");
 
     println!(
-        "total_circuit_entropy = {:.6} bits  ({} outputs)",
+        "total_circuit_entropy = {:.6} bits  ({} nodes)",
         total_entropy,
         results.len()
     );
@@ -112,7 +112,7 @@ fn run_merge(args: MergeArgs) {
     write_counts_file(&args.output, 0, &results).expect("Failed to write merged output");
 
     println!(
-        "total_circuit_entropy = {:.6} bits  ({} outputs)",
+        "total_circuit_entropy = {:.6} bits  ({} nodes)",
         total_entropy,
         results.len()
     );

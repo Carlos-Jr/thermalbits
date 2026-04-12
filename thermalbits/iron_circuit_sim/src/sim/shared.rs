@@ -1,6 +1,6 @@
 //! Objetivo: fornecer tipos e primitivas compartilhadas entre os modos full e chunk.
 //! Entradas: bitsets de sinais, dependencias de gates e contagens brutas.
-//! Saidas: `GateResult`, mascaras de palavras e suporte a refcount/dependencias.
+//! Saidas: `NodeResult`, mascaras de palavras e suporte a refcount/dependencias.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -8,16 +8,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::circuit::{Circuit, Op};
 
 #[derive(Clone, Debug)]
-pub struct GateResult {
+pub struct NodeResult {
     pub gate_id: u32,
-    pub output_index: u32,
-    pub op: Op,
-    pub support_len: usize,
+    pub n_inputs: usize,
+    pub n_outputs: usize,
     pub total: u64,
     /// Joint input distribution: length = 2^n_inputs.
     /// Indexed by big-endian pattern: input_0 is MSB.
-    pub joint_counts: Vec<u64>,
-    pub pop_y: u64,
+    pub input_joint: Vec<u64>,
+    /// Joint output distribution: length = 2^n_outputs.
+    /// Indexed by big-endian pattern: output_0 is MSB.
+    pub output_joint: Vec<u64>,
 }
 
 #[inline]
@@ -48,14 +49,12 @@ pub(crate) fn last_word_mask_from_total(total_bits: u64) -> u64 {
 /// Evaluate a single fanout output over word vectors.
 ///
 /// `input_sigs`: slice of (word_vector, is_inverted) per input to this output.
-/// Returns (output_words, Option<(joint_counts, pop_y)>).
-/// Joint counts use big-endian indexing: input_0 contributes to the MSB of the pattern index.
+/// Returns the output word vector.
 pub(crate) fn eval_output_words(
     input_sigs: &[(&[u64], bool)],
     op: Op,
     total_bits: u64,
-    need_counts: bool,
-) -> (Vec<u64>, Option<(Vec<u64>, u64)>) {
+) -> Vec<u64> {
     let n_inputs = input_sigs.len();
     assert!(n_inputs > 0, "fanout output must have at least 1 input");
     let n_words = input_sigs[0].0.len();
@@ -112,38 +111,7 @@ pub(crate) fn eval_output_words(
         *lw &= last_mask;
     }
 
-    if !need_counts {
-        return (out, None);
-    }
-
-    // Compute joint counts (big-endian: input_0 is MSB of pattern index).
-    let n_patterns = 1usize << n_inputs;
-    let mut counts = vec![0u64; n_patterns];
-
-    for w in 0..n_words {
-        let is_last = w + 1 == n_words;
-        let mask = if is_last { last_mask } else { !0u64 };
-
-        for p in 0..n_patterns {
-            let mut pm = mask;
-            for i in 0..n_inputs {
-                let bit = (p >> (n_inputs - 1 - i)) & 1;
-                if bit == 1 {
-                    pm &= prepared[i][w];
-                } else {
-                    pm &= !prepared[i][w];
-                }
-            }
-            counts[p] += pm.count_ones() as u64;
-        }
-    }
-
-    let mut pop_y = 0u64;
-    for &w in &out {
-        pop_y += w.count_ones() as u64;
-    }
-
-    (out, Some((counts, pop_y)))
+    out
 }
 
 /// Compute majority output at word level using an adder-tree approach.
@@ -197,6 +165,47 @@ fn compute_majority_words(inputs: &[Vec<u64>], n_words: usize, last_mask: u64) -
         *lw &= last_mask;
     }
     out
+}
+
+/// Compute the joint distribution of a set of signal word-vectors.
+///
+/// Returns a vector of 2^n counts, where n = signals.len().
+/// Pattern indexing is big-endian: signal\[0\] contributes to MSB.
+pub(crate) fn compute_joint_counts(
+    signals: &[&[u64]],
+    n_words: usize,
+    total_bits: u64,
+) -> Vec<u64> {
+    let n = signals.len();
+    let n_patterns = 1usize << n;
+    let mut counts = vec![0u64; n_patterns];
+
+    if n == 0 {
+        counts[0] = total_bits;
+        return counts;
+    }
+
+    let last_mask = last_word_mask_from_total(total_bits);
+
+    for w in 0..n_words {
+        let is_last = w + 1 == n_words;
+        let mask = if is_last { last_mask } else { !0u64 };
+
+        for p in 0..n_patterns {
+            let mut pm = mask;
+            for i in 0..n {
+                let bit = (p >> (n - 1 - i)) & 1;
+                if bit == 1 {
+                    pm &= signals[i][w];
+                } else {
+                    pm &= !signals[i][w];
+                }
+            }
+            counts[p] += pm.count_ones() as u64;
+        }
+    }
+
+    counts
 }
 
 pub(crate) fn compute_gate_refcounts(circuit: &Circuit) -> HashMap<u32, AtomicU32> {

@@ -1,14 +1,14 @@
 //! Objetivo: executar a simulacao full com tabelas-verdade por suporte local.
 //! Entradas: `Circuit` completo, sempre considerando todas as gates do circuito.
-//! Saidas: `Vec<GateResult>` com contagens exatas por gate/output no modo full.
+//! Saidas: `Vec<NodeResult>` com contagens exatas por node no modo full.
 
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::circuit::Circuit;
 use crate::sim::shared::{
-    compute_gate_refcounts, eval_output_words, mask_last_word, num_words, release_refcount,
-    GateResult,
+    compute_gate_refcounts, compute_joint_counts, eval_output_words, mask_last_word, num_words,
+    release_refcount, NodeResult,
 };
 
 #[inline]
@@ -157,7 +157,7 @@ fn resolve_fanin_tt(
     }
 }
 
-pub fn process_circuit(circuit: &Circuit) -> Vec<GateResult> {
+pub fn process_circuit(circuit: &Circuit) -> Vec<NodeResult> {
     eprintln!(
         "  Full mode will process all {} gates in topological order",
         circuit.gates.len()
@@ -165,7 +165,7 @@ pub fn process_circuit(circuit: &Circuit) -> Vec<GateResult> {
 
     let refcounts = compute_gate_refcounts(circuit);
     let mut tt_store: HashMap<u32, (Vec<u32>, Vec<Vec<u64>>)> = HashMap::new();
-    let mut results: Vec<GateResult> = Vec::new();
+    let mut results: Vec<NodeResult> = Vec::new();
 
     for level in 1..=circuit.max_level {
         let Some(gate_ids) = circuit.levels.get(&level) else {
@@ -175,11 +175,12 @@ pub fn process_circuit(circuit: &Circuit) -> Vec<GateResult> {
         let gates_here: Vec<_> = gate_ids.iter().map(|id| &circuit.gates[id]).collect();
 
         // Parallel: compute all gates at this level.
-        let computed: Vec<(u32, Vec<u32>, Vec<(Vec<u64>, Option<(Vec<u64>, u64)>)>)> = gates_here
+        let computed: Vec<(u32, Vec<u32>, Vec<Vec<u64>>, NodeResult)> = gates_here
             .par_iter()
             .map(|g| {
                 let sup = &g.support;
                 let total = truth_table_total(sup.len());
+                let nw = num_words(truth_table_bits(sup.len()));
 
                 // Resolve all fanin TTs for this gate.
                 let fanin_tts: Vec<Vec<u64>> = g
@@ -191,7 +192,7 @@ pub fn process_circuit(circuit: &Circuit) -> Vec<GateResult> {
                     .collect();
 
                 // Evaluate each fanout entry.
-                let output_results: Vec<(Vec<u64>, Option<(Vec<u64>, u64)>)> = g
+                let output_tts: Vec<Vec<u64>> = g
                     .fanout
                     .iter()
                     .map(|fo| {
@@ -201,35 +202,37 @@ pub fn process_circuit(circuit: &Circuit) -> Vec<GateResult> {
                             .enumerate()
                             .map(|(i, &idx)| (fanin_tts[idx].as_slice(), fo.invert[i]))
                             .collect();
-                        eval_output_words(&inputs, fo.op, total, true)
+                        eval_output_words(&inputs, fo.op, total)
                     })
                     .collect();
 
-                (g.id, sup.clone(), output_results)
+                // Compute input joint distribution.
+                let input_refs: Vec<&[u64]> =
+                    fanin_tts.iter().map(|t| t.as_slice()).collect();
+                let input_joint = compute_joint_counts(&input_refs, nw, total);
+
+                // Compute output joint distribution.
+                let output_refs: Vec<&[u64]> =
+                    output_tts.iter().map(|t| t.as_slice()).collect();
+                let output_joint = compute_joint_counts(&output_refs, nw, total);
+
+                let result = NodeResult {
+                    gate_id: g.id,
+                    n_inputs: fanin_tts.len(),
+                    n_outputs: output_tts.len(),
+                    total,
+                    input_joint,
+                    output_joint,
+                };
+
+                (g.id, sup.clone(), output_tts, result)
             })
             .collect();
 
         // Sequential: store results and manage refcounts.
-        for (gid, sup, output_results) in computed {
+        for (gid, sup, output_tts, node_result) in computed {
             let g = &circuit.gates[&gid];
-            let total = truth_table_total(sup.len());
-            let mut output_tts = Vec::with_capacity(output_results.len());
-
-            for (fo_idx, (out_tt, maybe_counts)) in output_results.into_iter().enumerate() {
-                if let Some((joint_counts, pop_y)) = maybe_counts {
-                    results.push(GateResult {
-                        gate_id: gid,
-                        output_index: fo_idx as u32,
-                        op: g.fanout[fo_idx].op,
-                        support_len: sup.len(),
-                        total,
-                        joint_counts,
-                        pop_y,
-                    });
-                }
-                output_tts.push(out_tt);
-            }
-
+            results.push(node_result);
             tt_store.insert(gid, (sup, output_tts));
 
             for &(src_id, _) in &g.fanin {
@@ -244,6 +247,6 @@ pub fn process_circuit(circuit: &Circuit) -> Vec<GateResult> {
         }
     }
 
-    results.sort_by_key(|r| (r.gate_id, r.output_index));
+    results.sort_by_key(|r| r.gate_id);
     results
 }
