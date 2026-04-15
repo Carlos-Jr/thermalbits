@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from thermalbits import ThermalBits
+from thermalbits import DEPTH_ORIENTED, ENERGY_ORIENTED, ThermalBits
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +35,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Numero de chunks calculados simultaneamente (padrao: 2).",
+    )
+    parser.add_argument(
+        "--energy-oriented",
+        action="store_true",
+        help="Aplica o metodo Energy-Oriented (EO) e calcula a entropia da versao transformada.",
+    )
+    parser.add_argument(
+        "--depth-oriented",
+        action="store_true",
+        help="Aplica o metodo Depth-Oriented (DO) e calcula a entropia da versao transformada.",
     )
     return parser.parse_args()
 
@@ -84,6 +94,8 @@ def main() -> int:
                 f"\toutput={output_path}"
                 f"\tchunks={args.chunks}"
                 f"\tparallel_chunks={args.parallel_chunks}"
+                f"\tenergy_oriented={args.energy_oriented}"
+                f"\tdepth_oriented={args.depth_oriented}"
                 f"\ttotal_files={len(verilog_files)}"
             ),
         )
@@ -96,27 +108,20 @@ def main() -> int:
         ok_count = 0
         error_count = 0
 
+        methods: list[tuple[str, int | None]] = [("original", None)]
+        if args.depth_oriented:
+            methods.append(("DO", DEPTH_ORIENTED))
+        if args.energy_oriented:
+            methods.append(("EO", ENERGY_ORIENTED))
+
         for verilog_path in verilog_files:
             print(f"Tentando arquivo {verilog_path}")
-            started = time.perf_counter()
             relative_path = str(verilog_path.relative_to(input_dir))
 
             try:
                 tb = ThermalBits(str(verilog_path))
-                entropy = tb.update_entropy(chunks=args.chunks, parallel_chunks=args.parallel_chunks)
-                elapsed_s = time.perf_counter() - started
-                write_line(
-                    out,
-                    format_result(
-                        "OK",
-                        relative_path,
-                        f"entropy={entropy:.6f}",
-                        elapsed_s,
-                    ),
-                )
-                ok_count += 1
             except Exception as exc:
-                elapsed_s = time.perf_counter() - started
+                elapsed_s = 0.0
                 write_line(
                     out,
                     format_result(
@@ -127,6 +132,39 @@ def main() -> int:
                     ),
                 )
                 error_count += 1
+                continue
+
+            for label, method in methods:
+                started = time.perf_counter()
+                try:
+                    if method is not None:
+                        variant = tb.copy().apply(method)
+                    else:
+                        variant = tb
+                    entropy = variant.update_entropy(chunks=args.chunks, parallel_chunks=args.parallel_chunks)
+                    elapsed_s = time.perf_counter() - started
+                    write_line(
+                        out,
+                        format_result(
+                            "OK",
+                            relative_path,
+                            f"method={label}\tentropy={entropy:.6f}",
+                            elapsed_s,
+                        ),
+                    )
+                    ok_count += 1
+                except Exception as exc:
+                    elapsed_s = time.perf_counter() - started
+                    write_line(
+                        out,
+                        format_result(
+                            "ERROR",
+                            relative_path,
+                            f"method={label}\t{type(exc).__name__}: {exc}",
+                            elapsed_s,
+                        ),
+                    )
+                    error_count += 1
 
         total_elapsed = time.perf_counter() - total_started
         write_line(

@@ -28,6 +28,7 @@ dependencies = []
 [project.optional-dependencies]
 viz = [
   "matplotlib>=3.8",
+  "networkx>=3.2",
 ]
 dev = [
   "build>=1.2.2",

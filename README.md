@@ -4,7 +4,7 @@ A library for inspecting combinational digital circuits from Verilog netlists, f
 
 ### Installation
 
-With visualization support (matplotlib):
+With visualization support (matplotlib + networkx):
 
 ```bash
 pip install -r requirements.txt
@@ -170,6 +170,12 @@ tb.visualize_dag(
 )
 ```
 
+#### Node styling
+
+Primary inputs and primary outputs are shown as black nodes. Internal gates are
+white by default, and gates with more than one fanout target are highlighted in
+blue.
+
 #### Edge styling
 
 The renderer encodes extra information on the edges themselves:
@@ -270,7 +276,7 @@ edge from PI 0 into node 5 marking the inverted input.
 If necessary, install the visualization dependency:
 
 ```bash
-pip install matplotlib
+pip install matplotlib networkx
 ```
 
 ### Convert to Verilog

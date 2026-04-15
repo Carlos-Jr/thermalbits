@@ -1,3 +1,4 @@
 # Runtime dependencies for full ThermalBits experience.
-# Core library works with Python stdlib only; DAG rendering needs matplotlib.
+# Core library works with Python stdlib only; DAG rendering needs matplotlib and networkx.
 matplotlib>=3.8
+networkx>=3.2

@@ -1,7 +1,10 @@
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 from .generate_overview import _state_overview
+
+Edge = tuple[int, int, int, bool]
+Point = tuple[float, float]
 
 
 def _parse_level_window(level_window: Sequence[int] | None) -> tuple[int, int] | None:
@@ -27,14 +30,18 @@ def _node_role(node_id: int, pis: set[int], pos: set[int]) -> str:
     return "internal"
 
 
-def _node_color(role: str) -> str:
-    if role == "input":
+def _node_color(role: str, has_multiple_fanout: bool) -> str:
+    if role in ("input", "output", "input_output"):
+        return "#111827"
+    if has_multiple_fanout:
         return "#4DA3D9"
-    if role == "output":
-        return "#F39C4A"
-    if role == "input_output":
-        return "#A173D1"
-    return "#C9CED4"
+    return "#F8FAFC"
+
+
+def _label_color(role: str) -> str:
+    if role in ("input", "output", "input_output"):
+        return "#FFFFFF"
+    return "#111827"
 
 
 _FANOUT_EDGE_COLORS = (
@@ -114,15 +121,135 @@ def _group_by_level(
     return [(level, sorted(grouped[level])) for level in sorted(grouped)]
 
 
+def _centered_offsets(count: int, step: float, max_abs: float) -> list[float]:
+    offsets = [(i - (count - 1) / 2.0) * step for i in range(count)]
+    largest = max((abs(value) for value in offsets), default=0.0)
+    if largest > max_abs:
+        scale = max_abs / largest
+        offsets = [value * scale for value in offsets]
+    return offsets
+
+
+def _weighted_neighbor_score(
+    graph: object,
+    node_id: int,
+    neighbors: Iterable[int],
+    centered_index_by_id: dict[int, float],
+) -> float | None:
+    total = 0.0
+    total_weight = 0.0
+    for neighbor in neighbors:
+        if neighbor not in centered_index_by_id:
+            continue
+        weight = 1.0
+        if graph.has_edge(neighbor, node_id):
+            weight = float(graph[neighbor][node_id].get("weight", 1.0))
+        elif graph.has_edge(node_id, neighbor):
+            weight = float(graph[node_id][neighbor].get("weight", 1.0))
+        total += centered_index_by_id[neighbor] * weight
+        total_weight += weight
+    if total_weight == 0.0:
+        return None
+    return total / total_weight
+
+
+def _centered_index_by_id(
+    ordered_by_level: dict[int, list[int]],
+) -> dict[int, float]:
+    centered: dict[int, float] = {}
+    for nodes in ordered_by_level.values():
+        count = len(nodes)
+        for index, node_id in enumerate(nodes):
+            centered[node_id] = index - (count - 1) / 2.0
+    return centered
+
+
+def _networkx_ordered_levels(
+    grouped_levels: list[tuple[int, list[int]]],
+    graph: object,
+    iterations: int = 8,
+) -> list[tuple[int, list[int]]]:
+    if len(grouped_levels) <= 1:
+        return grouped_levels
+
+    levels = [level for level, _ in grouped_levels]
+    ordered_by_level = {level: list(nodes) for level, nodes in grouped_levels}
+
+    for _ in range(iterations):
+        for level in levels[1:]:
+            centered = _centered_index_by_id(ordered_by_level)
+            current_nodes = ordered_by_level[level]
+            current_center = (len(current_nodes) - 1) / 2.0
+            scored = []
+            for index, node_id in enumerate(current_nodes):
+                score = _weighted_neighbor_score(
+                    graph,
+                    node_id,
+                    graph.predecessors(node_id),
+                    centered,
+                )
+                if score is None:
+                    score = index - current_center
+                scored.append((score, index, node_id))
+            ordered_by_level[level] = [node_id for _, _, node_id in sorted(scored)]
+
+        for level in reversed(levels[:-1]):
+            centered = _centered_index_by_id(ordered_by_level)
+            current_nodes = ordered_by_level[level]
+            current_center = (len(current_nodes) - 1) / 2.0
+            scored = []
+            for index, node_id in enumerate(current_nodes):
+                score = _weighted_neighbor_score(
+                    graph,
+                    node_id,
+                    graph.successors(node_id),
+                    centered,
+                )
+                if score is None:
+                    score = index - current_center
+                scored.append((score, index, node_id))
+            ordered_by_level[level] = [node_id for _, _, node_id in sorted(scored)]
+
+    return [(level, ordered_by_level[level]) for level in levels]
+
+
+def _build_layout_graph(
+    visible_ids: set[int],
+    visible_edges: Sequence[Edge],
+    level_by_id: dict[int, int],
+) -> object:
+    try:
+        import networkx as nx
+    except ImportError as exc:
+        raise ImportError(
+            "networkx is required for DAG visualization. Install it with: pip install networkx"
+        ) from exc
+
+    graph = nx.DiGraph()
+    for node_id in visible_ids:
+        graph.add_node(node_id, subset=level_by_id[node_id])
+    for src, dst, _, _ in visible_edges:
+        if src == dst:
+            continue
+        if graph.has_edge(src, dst):
+            graph[src][dst]["weight"] += 1
+        else:
+            graph.add_edge(src, dst, weight=1)
+    return graph
+
+
 def _build_positions(
     grouped_levels: list[tuple[int, list[int]]],
     orientation: str,
-) -> tuple[dict[int, tuple[float, float]], dict[int, float], tuple[float, float, float, float]]:
-    pos: dict[int, tuple[float, float]] = {}
+    layout_graph: object,
+) -> tuple[dict[int, Point], dict[int, float], tuple[float, float, float, float]]:
+    grouped_levels = _networkx_ordered_levels(grouped_levels, layout_graph)
+
+    pos: dict[int, Point] = {}
     axis_by_level: dict[int, float] = {}
 
-    level_gap = 4.0
-    node_gap = 1.8
+    level_gap = 4.4
+    node_gap = 2.2
     max_span = 0.0
 
     for level_idx, (level, node_ids) in enumerate(grouped_levels):
@@ -221,6 +348,195 @@ def _long_range_rad(
 
     rad = 2.0 * deflection / dist
     return max(-0.45, min(0.45, rad))
+
+
+def _transverse_value(
+    node_id: int,
+    pos_by_id: dict[int, Point],
+    orientation: str,
+) -> float:
+    x, y = pos_by_id[node_id]
+    return y if orientation == "horizontal" else x
+
+
+def _spread_edge_values(
+    edges: Sequence[Edge],
+    key_func: Callable[[Edge], object],
+    sort_key_func: Callable[[Edge], object],
+    step: float,
+    max_abs: float,
+) -> dict[Edge, float]:
+    values: dict[Edge, float] = defaultdict(float)
+    groups: dict[object, list[Edge]] = defaultdict(list)
+    for edge in edges:
+        groups[key_func(edge)].append(edge)
+
+    for group_edges in groups.values():
+        if len(group_edges) <= 1:
+            continue
+        ordered = sorted(group_edges, key=sort_key_func)
+        for edge, offset in zip(ordered, _centered_offsets(len(ordered), step, max_abs)):
+            values[edge] += offset
+    return dict(values)
+
+
+def _edge_port_offsets(
+    visible_edges: Sequence[Edge],
+    level_by_id: dict[int, int],
+    pos_by_id: dict[int, Point],
+    orientation: str,
+) -> tuple[dict[Edge, float], dict[Edge, float]]:
+    def transverse(node_id: int) -> float:
+        return _transverse_value(node_id, pos_by_id, orientation)
+
+    source_offsets = _spread_edge_values(
+        visible_edges,
+        key_func=lambda edge: edge[0],
+        sort_key_func=lambda edge: (
+            level_by_id[edge[1]],
+            transverse(edge[1]),
+            edge[1],
+            edge[2],
+            edge[3],
+        ),
+        step=0.13,
+        max_abs=0.34,
+    )
+    target_offsets = _spread_edge_values(
+        visible_edges,
+        key_func=lambda edge: edge[1],
+        sort_key_func=lambda edge: (
+            level_by_id[edge[0]],
+            transverse(edge[0]),
+            edge[0],
+            edge[2],
+            edge[3],
+        ),
+        step=0.13,
+        max_abs=0.34,
+    )
+    return source_offsets, target_offsets
+
+
+def _edge_curvatures(
+    visible_edges: Sequence[Edge],
+    level_by_id: dict[int, int],
+    pos_by_id: dict[int, Point],
+    grouped_levels: list[tuple[int, list[int]]],
+    orientation: str,
+) -> dict[Edge, float]:
+    def transverse(node_id: int) -> float:
+        return _transverse_value(node_id, pos_by_id, orientation)
+
+    curvature: dict[Edge, float] = defaultdict(float)
+
+    for edge, offset in _spread_edge_values(
+        visible_edges,
+        key_func=lambda edge: (edge[0], edge[1]),
+        sort_key_func=lambda edge: (edge[2], edge[3]),
+        step=0.22,
+        max_abs=0.38,
+    ).items():
+        curvature[edge] += offset
+
+    for edge, offset in _spread_edge_values(
+        visible_edges,
+        key_func=lambda edge: (edge[0], level_by_id[edge[1]]),
+        sort_key_func=lambda edge: (
+            transverse(edge[1]),
+            edge[1],
+            edge[2],
+            edge[3],
+        ),
+        step=0.07,
+        max_abs=0.16,
+    ).items():
+        curvature[edge] += offset
+
+    for edge, offset in _spread_edge_values(
+        visible_edges,
+        key_func=lambda edge: (level_by_id[edge[0]], edge[1]),
+        sort_key_func=lambda edge: (
+            transverse(edge[0]),
+            edge[0],
+            edge[2],
+            edge[3],
+        ),
+        step=0.07,
+        max_abs=0.16,
+    ).items():
+        curvature[edge] += offset
+
+    for edge, offset in _spread_edge_values(
+        visible_edges,
+        key_func=lambda edge: (
+            level_by_id[edge[0]],
+            level_by_id[edge[1]],
+            round((transverse(edge[0]) + transverse(edge[1])) / 0.9),
+        ),
+        sort_key_func=lambda edge: (
+            transverse(edge[0]),
+            transverse(edge[1]),
+            edge[0],
+            edge[1],
+            edge[2],
+            edge[3],
+        ),
+        step=0.035,
+        max_abs=0.10,
+    ).items():
+        curvature[edge] += offset
+
+    long_range_cache: dict[tuple[int, int], float] = {}
+    for src, dst, _, _ in visible_edges:
+        key = (src, dst)
+        if key not in long_range_cache:
+            long_range_cache[key] = _long_range_rad(
+                src,
+                dst,
+                level_by_id,
+                pos_by_id,
+                grouped_levels,
+                orientation,
+            )
+
+    return {
+        edge: max(-0.58, min(0.58, curvature[edge] + long_range_cache[(edge[0], edge[1])]))
+        for edge in visible_edges
+    }
+
+
+def _with_transverse_offset(
+    point: Point,
+    offset: float,
+    orientation: str,
+) -> Point:
+    x, y = point
+    if orientation == "horizontal":
+        return x, y + offset
+    return x + offset, y
+
+
+def _hidden_stub_offset(
+    node_id: int,
+    pos_by_id: dict[int, Point],
+    orientation: str,
+    direction: str,
+) -> float:
+    trans_values = [
+        _transverse_value(other_id, pos_by_id, orientation)
+        for other_id in pos_by_id
+        if other_id != node_id
+    ]
+    if not trans_values:
+        return 0.65
+
+    trans = _transverse_value(node_id, pos_by_id, orientation)
+    center = (min(trans_values) + max(trans_values)) / 2.0
+    sign = 1.0 if trans >= center else -1.0
+    if direction == "outgoing":
+        sign *= -1.0
+    return sign * 0.7
 
 
 def visualize_dag(
@@ -342,6 +658,21 @@ def visualize_dag(
     if not node_ids:
         raise ValueError("Overview has no nodes to visualize")
 
+    fanout_destinations_by_id: dict[int, set[int]] = defaultdict(set)
+    for src, dst, _, _ in edge_set:
+        fanout_destinations_by_id[src].add(dst)
+
+    has_multiple_fanout_by_id = {
+        node_id: (
+            node_id not in pis
+            and (
+                len(fanout_destinations_by_id.get(node_id, set())) > 1
+                or fanout_count_by_id.get(node_id, 0) > 1
+            )
+        )
+        for node_id in node_ids
+    }
+
     if parsed_window is None:
         visible_ids = set(node_ids)
         range_start = min(level_by_id.values())
@@ -358,14 +689,9 @@ def visualize_dag(
                 f"No nodes found in level window [{range_start}, {range_end}]"
             )
 
-    grouped = _group_by_level(visible_ids, level_by_id)
-    pos_by_id, axis_by_level, (x_min, x_max, y_min, y_max) = _build_positions(
-        grouped, orientation
-    )
-
     incoming_hidden: dict[int, int] = defaultdict(int)
     outgoing_hidden: dict[int, int] = defaultdict(int)
-    visible_edges: list[tuple[int, int, int, bool]] = []
+    visible_edges: list[Edge] = []
     for src, dst, out_idx, inverted in sorted(edge_set):
         src_visible = src in visible_ids
         dst_visible = dst in visible_ids
@@ -376,6 +702,18 @@ def visualize_dag(
             incoming_hidden[dst] += 1
         if src_visible and level_by_id[dst] > range_end:
             outgoing_hidden[src] += 1
+
+    grouped = _group_by_level(visible_ids, level_by_id)
+    layout_graph = _build_layout_graph(visible_ids, visible_edges, level_by_id)
+    pos_by_id, axis_by_level, (x_min, x_max, y_min, y_max) = _build_positions(
+        grouped, orientation, layout_graph
+    )
+    edge_curvature_by_edge = _edge_curvatures(
+        visible_edges, level_by_id, pos_by_id, grouped, orientation
+    )
+    source_port_offsets, target_port_offsets = _edge_port_offsets(
+        visible_edges, level_by_id, pos_by_id, orientation
+    )
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
 
@@ -404,61 +742,56 @@ def visualize_dag(
                 color="#2C3E50",
             )
 
-    parallel_groups: dict[tuple[int, int], list[tuple[int, int, int, bool]]] = defaultdict(list)
     for edge in visible_edges:
         src, dst, out_idx, inverted = edge
-        parallel_groups[(src, dst)].append(edge)
-
-    for (src, dst), group_edges in parallel_groups.items():
-        n = len(group_edges)
-        rad_step = 0.25
-        parallel_rads = [rad_step * (i - (n - 1) / 2.0) for i in range(n)]
-
-        lr_rad = _long_range_rad(src, dst, level_by_id, pos_by_id, grouped, orientation)
-
-        x0, y0 = pos_by_id[src]
-        x1, y1 = pos_by_id[dst]
-        for (_, _, out_idx, inverted), p_rad in zip(group_edges, parallel_rads):
-            total_rad = lr_rad + p_rad
-            ax.annotate(
-                "",
-                xy=(x1, y1),
-                xytext=(x0, y0),
-                arrowprops={
-                    "arrowstyle": "->",
-                    "linewidth": 1.2,
-                    "color": _fanout_color(out_idx),
-                    "linestyle": "--" if inverted else "-",
-                    "alpha": 0.85,
-                    "shrinkA": 15,
-                    "shrinkB": 15,
-                    "connectionstyle": f"arc3,rad={total_rad:.3f}",
-                },
-            )
+        x0, y0 = _with_transverse_offset(
+            pos_by_id[src], source_port_offsets.get(edge, 0.0), orientation
+        )
+        x1, y1 = _with_transverse_offset(
+            pos_by_id[dst], target_port_offsets.get(edge, 0.0), orientation
+        )
+        ax.annotate(
+            "",
+            xy=(x1, y1),
+            xytext=(x0, y0),
+            arrowprops={
+                "arrowstyle": "->",
+                "linewidth": 1.2,
+                "color": _fanout_color(out_idx),
+                "linestyle": "--" if inverted else "-",
+                "alpha": 0.86,
+                "shrinkA": 15,
+                "shrinkB": 15,
+                "connectionstyle": f"arc3,rad={edge_curvature_by_edge[edge]:.3f}",
+            },
+        )
 
     if orientation == "horizontal":
         left_stub_x = x_min + 0.4
         right_stub_x = x_max - 0.4
         for dst, count in incoming_hidden.items():
             x1, y1 = pos_by_id[dst]
+            stub_offset = _hidden_stub_offset(dst, pos_by_id, orientation, "incoming")
             ax.annotate(
                 "",
                 xy=(x1 - 0.35, y1),
-                xytext=(left_stub_x, y1),
+                xytext=(left_stub_x, y1 + stub_offset),
                 arrowprops={
                     "arrowstyle": "->",
                     "linewidth": 1.0,
                     "color": "#7F8C8D",
                     "linestyle": ":",
                     "alpha": 0.75,
+                    "connectionstyle": "arc3,rad=0.220",
                 },
             )
-            ax.text(left_stub_x - 0.1, y1 + 0.15, f"+{count}", fontsize=8, ha="right", va="bottom")
+            ax.text(left_stub_x - 0.1, y1 + stub_offset + 0.15, f"+{count}", fontsize=8, ha="right", va="bottom")
         for src, count in outgoing_hidden.items():
             x0, y0 = pos_by_id[src]
+            stub_offset = _hidden_stub_offset(src, pos_by_id, orientation, "outgoing")
             ax.annotate(
                 "",
-                xy=(right_stub_x, y0),
+                xy=(right_stub_x, y0 + stub_offset),
                 xytext=(x0 + 0.35, y0),
                 arrowprops={
                     "arrowstyle": "->",
@@ -466,32 +799,36 @@ def visualize_dag(
                     "color": "#7F8C8D",
                     "linestyle": ":",
                     "alpha": 0.75,
+                    "connectionstyle": "arc3,rad=0.220",
                 },
             )
-            ax.text(right_stub_x + 0.1, y0 + 0.15, f"+{count}", fontsize=8, ha="left", va="bottom")
+            ax.text(right_stub_x + 0.1, y0 + stub_offset + 0.15, f"+{count}", fontsize=8, ha="left", va="bottom")
     else:
         top_stub_y = y_max - 0.4
         bottom_stub_y = y_min + 0.4
         for dst, count in incoming_hidden.items():
             x1, y1 = pos_by_id[dst]
+            stub_offset = _hidden_stub_offset(dst, pos_by_id, orientation, "incoming")
             ax.annotate(
                 "",
                 xy=(x1, y1 + 0.35),
-                xytext=(x1, top_stub_y),
+                xytext=(x1 + stub_offset, top_stub_y),
                 arrowprops={
                     "arrowstyle": "->",
                     "linewidth": 1.0,
                     "color": "#7F8C8D",
                     "linestyle": ":",
                     "alpha": 0.75,
+                    "connectionstyle": "arc3,rad=0.220",
                 },
             )
-            ax.text(x1 + 0.12, top_stub_y + 0.05, f"+{count}", fontsize=8, ha="left", va="bottom")
+            ax.text(x1 + stub_offset + 0.12, top_stub_y + 0.05, f"+{count}", fontsize=8, ha="left", va="bottom")
         for src, count in outgoing_hidden.items():
             x0, y0 = pos_by_id[src]
+            stub_offset = _hidden_stub_offset(src, pos_by_id, orientation, "outgoing")
             ax.annotate(
                 "",
-                xy=(x0, bottom_stub_y),
+                xy=(x0 + stub_offset, bottom_stub_y),
                 xytext=(x0, y0 - 0.35),
                 arrowprops={
                     "arrowstyle": "->",
@@ -499,9 +836,10 @@ def visualize_dag(
                     "color": "#7F8C8D",
                     "linestyle": ":",
                     "alpha": 0.75,
+                    "connectionstyle": "arc3,rad=0.220",
                 },
             )
-            ax.text(x0 + 0.12, bottom_stub_y - 0.05, f"+{count}", fontsize=8, ha="left", va="top")
+            ax.text(x0 + stub_offset + 0.12, bottom_stub_y - 0.05, f"+{count}", fontsize=8, ha="left", va="top")
 
     marker_groups: dict[str, list[int]] = defaultdict(list)
     for node_id in visible_ids:
@@ -510,7 +848,13 @@ def visualize_dag(
     for marker, ids in marker_groups.items():
         xs = [pos_by_id[node_id][0] for node_id in ids]
         ys = [pos_by_id[node_id][1] for node_id in ids]
-        colors = [_node_color(_node_role(node_id, pis, pos)) for node_id in ids]
+        colors = [
+            _node_color(
+                _node_role(node_id, pis, pos),
+                has_multiple_fanout_by_id.get(node_id, False),
+            )
+            for node_id in ids
+        ]
         ax.scatter(
             xs,
             ys,
@@ -524,6 +868,7 @@ def visualize_dag(
 
     for node_id in visible_ids:
         x, y = pos_by_id[node_id]
+        role = _node_role(node_id, pis, pos)
         ax.text(
             x,
             y,
@@ -531,7 +876,7 @@ def visualize_dag(
             ha="center",
             va="center",
             fontsize=8,
-            color="#111827",
+            color=_label_color(role),
             zorder=4,
         )
 
