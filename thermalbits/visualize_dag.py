@@ -30,16 +30,16 @@ def _node_role(node_id: int, pis: set[int], pos: set[int]) -> str:
     return "internal"
 
 
-def _node_color(role: str, has_multiple_fanout: bool) -> str:
-    if role in ("input", "output", "input_output"):
+def _node_color(role: str, has_mixed_fanout_ops: bool) -> str:
+    if role in ("input", "input_output"):
         return "#111827"
-    if has_multiple_fanout:
+    if has_mixed_fanout_ops:
         return "#4DA3D9"
     return "#F8FAFC"
 
 
 def _label_color(role: str) -> str:
-    if role in ("input", "output", "input_output"):
+    if role in ("input", "input_output"):
         return "#FFFFFF"
     return "#111827"
 
@@ -62,27 +62,17 @@ def _fanout_color(output_index: int) -> str:
     return _FANOUT_EDGE_COLORS[output_index % len(_FANOUT_EDGE_COLORS)]
 
 
-def _node_marker(node_id: int, node_kind_by_id: dict[int, str], pis: set[int]) -> str:
-    if node_id in pis:
-        return "o"
-    node_kind = node_kind_by_id.get(node_id)
-    if node_kind == "&":
-        return "s"
-    if node_kind == "|":
-        return "D"
-    if node_kind == "^":
-        return "X"
-    if node_kind == "M":
-        return "^"
-    if node_kind == "multi":
-        return "P"
-    return "o"
+def _primary_gate_op(fanout_ops: list[str]) -> str:
+    for op in fanout_ops:
+        if op != "-":
+            return op
+    return fanout_ops[0] if fanout_ops else ""
 
 
 def _gate_label(
     node_id: int,
     node_kind_by_id: dict[int, str],
-    fanout_count_by_id: dict[int, int],
+    pi_count: int,
     pis: set[int],
     pos: set[int],
 ) -> str:
@@ -90,25 +80,10 @@ def _gate_label(
     if role == "input":
         return f"PI {node_id}"
     if role == "input_output":
-        return f"PI/PO {node_id}"
+        return f"PI {node_id}"
     gate = node_kind_by_id.get(node_id, "")
-    if gate == "&":
-        gate_name = "AND"
-    elif gate == "|":
-        gate_name = "OR"
-    elif gate == "^":
-        gate_name = "XOR"
-    elif gate == "M":
-        gate_name = "MAJ"
-    elif gate == "-":
-        gate_name = "WIRE"
-    elif gate == "multi":
-        gate_name = f"NODE x{fanout_count_by_id.get(node_id, 0)}"
-    else:
-        gate_name = "NODE"
-    if role == "output":
-        return f"{gate_name} {node_id}\nPO"
-    return f"{gate_name} {node_id}"
+    adjusted_id = node_id - pi_count
+    return f"{gate} {adjusted_id}" if gate else str(adjusted_id)
 
 
 def _group_by_level(
@@ -539,6 +514,49 @@ def _hidden_stub_offset(
     return sign * 0.7
 
 
+def _draw_po_stubs(
+    ax,
+    pos_raw: list[int],
+    visible_ids: set[int],
+    pos_by_id: dict[int, Point],
+    orientation: str,
+) -> None:
+    for po_index, node_id in enumerate(pos_raw):
+        if node_id not in visible_ids:
+            continue
+
+        x, y = pos_by_id[node_id]
+        if orientation == "horizontal":
+            start = (x, y)
+            end = (x + 1.15, y)
+            text_xy = (end[0] + 0.1, end[1] + 0.22)
+            ha, va = "left", "bottom"
+        else:
+            start = (x, y)
+            end = (x, y - 1.05)
+            text_xy = (end[0] + 0.24, end[1] + 0.12)
+            ha, va = "left", "center"
+
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            color="#111827",
+            linewidth=1.2,
+            solid_capstyle="round",
+            zorder=2.7,
+        )
+        ax.text(
+            text_xy[0],
+            text_xy[1],
+            f"PO{po_index}",
+            ha=ha,
+            va=va,
+            fontsize=8,
+            color="#111827",
+            zorder=6,
+        )
+
+
 def visualize_dag(
     self,
     output_path: str,
@@ -587,7 +605,7 @@ def visualize_dag(
     pos = set(pos_raw)
 
     node_kind_by_id: dict[int, str] = {}
-    fanout_count_by_id: dict[int, int] = {}
+    fanout_ops_by_id: dict[int, set[str]] = {}
     edge_set: set[tuple[int, int, int, bool]] = set()
     node_ids = set(pis) | set(pos)
 
@@ -635,8 +653,8 @@ def visualize_dag(
                 invert_by_fanin[local_idx].add(bool(inv))
             fanout_ops.append(op)
 
-        node_kind_by_id[node_id] = fanout_ops[0] if len(fanout_ops) == 1 else "multi"
-        fanout_count_by_id[node_id] = len(fanout_ops)
+        node_kind_by_id[node_id] = _primary_gate_op(fanout_ops)
+        fanout_ops_by_id[node_id] = set(fanout_ops)
         level_by_id[node_id] = node_level
         node_ids.add(node_id)
 
@@ -658,18 +676,8 @@ def visualize_dag(
     if not node_ids:
         raise ValueError("Overview has no nodes to visualize")
 
-    fanout_destinations_by_id: dict[int, set[int]] = defaultdict(set)
-    for src, dst, _, _ in edge_set:
-        fanout_destinations_by_id[src].add(dst)
-
-    has_multiple_fanout_by_id = {
-        node_id: (
-            node_id not in pis
-            and (
-                len(fanout_destinations_by_id.get(node_id, set())) > 1
-                or fanout_count_by_id.get(node_id, 0) > 1
-            )
-        )
+    has_mixed_fanout_ops_by_id = {
+        node_id: node_id not in pis and len(fanout_ops_by_id.get(node_id, set())) > 1
         for node_id in node_ids
     }
 
@@ -841,38 +849,33 @@ def visualize_dag(
             )
             ax.text(x0 + stub_offset + 0.12, bottom_stub_y - 0.05, f"+{count}", fontsize=8, ha="left", va="top")
 
-    marker_groups: dict[str, list[int]] = defaultdict(list)
-    for node_id in visible_ids:
-        marker_groups[_node_marker(node_id, node_kind_by_id, pis)].append(node_id)
+    _draw_po_stubs(ax, pos_raw, visible_ids, pos_by_id, orientation)
 
-    for marker, ids in marker_groups.items():
-        xs = [pos_by_id[node_id][0] for node_id in ids]
-        ys = [pos_by_id[node_id][1] for node_id in ids]
-        colors = [
+    visible_ids_sorted = sorted(visible_ids)
+    ax.scatter(
+        [pos_by_id[node_id][0] for node_id in visible_ids_sorted],
+        [pos_by_id[node_id][1] for node_id in visible_ids_sorted],
+        s=950,
+        c=[
             _node_color(
                 _node_role(node_id, pis, pos),
-                has_multiple_fanout_by_id.get(node_id, False),
+                has_mixed_fanout_ops_by_id.get(node_id, False),
             )
-            for node_id in ids
-        ]
-        ax.scatter(
-            xs,
-            ys,
-            s=950,
-            c=colors,
-            marker=marker,
-            edgecolors="#1F2933",
-            linewidths=1.0,
-            zorder=3,
-        )
+            for node_id in visible_ids_sorted
+        ],
+        marker="o",
+        edgecolors="#1F2933",
+        linewidths=1.0,
+        zorder=3,
+    )
 
-    for node_id in visible_ids:
+    for node_id in visible_ids_sorted:
         x, y = pos_by_id[node_id]
         role = _node_role(node_id, pis, pos)
         ax.text(
             x,
             y,
-            _gate_label(node_id, node_kind_by_id, fanout_count_by_id, pis, pos),
+            _gate_label(node_id, node_kind_by_id, len(pis), pis, pos),
             ha="center",
             va="center",
             fontsize=8,
@@ -896,12 +899,22 @@ def visualize_dag(
     if parsed_window is not None:
         info_lines.append(f"Faixa exibida: {range_start}..{range_end}")
     if info_lines:
+        if orientation == "vertical":
+            info_x = x_min + 0.25
+            info_y = y_min - 0.25
+            info_ha = "left"
+            info_va = "top"
+        else:
+            info_x = x_min + 0.25
+            info_y = y_min + 0.25
+            info_ha = "left"
+            info_va = "bottom"
         ax.text(
-            x_min + 0.25,
-            y_min + 0.25,
+            info_x,
+            info_y,
             "\n".join(info_lines),
-            ha="left",
-            va="bottom",
+            ha=info_ha,
+            va=info_va,
             fontsize=9,
             color="#374151",
             bbox={"boxstyle": "round,pad=0.3", "fc": "#F7F9FB", "ec": "#CBD5E1", "alpha": 0.9},
@@ -910,7 +923,7 @@ def visualize_dag(
     title_orientation = "Horizontal" if orientation == "horizontal" else "Vertical"
     ax.set_title(f"Circuit DAG ({title_orientation})", fontsize=12, color="#0F172A")
     ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
+    ax.set_ylim(y_min - 0.9 if orientation == "vertical" and info_lines else y_min, y_max)
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
     fig.tight_layout()

@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 from thermalbits import DEPTH_ORIENTED, ENERGY_ORIENTED, ThermalBits
@@ -12,7 +12,7 @@ from thermalbits import DEPTH_ORIENTED, ENERGY_ORIENTED, ThermalBits
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Calcula a entropia de todos os arquivos Verilog em uma pasta."
+        description="Calcula tamanho, profundidade e energia de arquivos Verilog em CSV."
     )
     parser.add_argument(
         "input_dir",
@@ -21,8 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        default="entropy_results.txt",
-        help="Arquivo TXT para registrar os resultados em tempo real.",
+        default="entropy_results.csv",
+        help="Arquivo CSV para registrar os resultados.",
     )
     parser.add_argument(
         "--chunks",
@@ -39,12 +39,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--energy-oriented",
         action="store_true",
-        help="Aplica o metodo Energy-Oriented (EO) e calcula a entropia da versao transformada.",
+        help=(
+            "Inclui o metodo Energy-Oriented (EO). Se nenhum metodo for "
+            "selecionado, EO e DO sao executados por padrao."
+        ),
     )
     parser.add_argument(
         "--depth-oriented",
         action="store_true",
-        help="Aplica o metodo Depth-Oriented (DO) e calcula a entropia da versao transformada.",
+        help=(
+            "Inclui o metodo Depth-Oriented (DO). Se nenhum metodo for "
+            "selecionado, EO e DO sao executados por padrao."
+        ),
     )
     return parser.parse_args()
 
@@ -54,15 +60,22 @@ def find_verilog_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
-def format_result(status: str, relative_path: str, message: str, elapsed_s: float) -> str:
-    timestamp = datetime.now().isoformat(timespec="seconds")
-    return f"{timestamp}\t{status}\t{relative_path}\t{message}\telapsed_s={elapsed_s:.3f}"
+def circuit_size_and_depth(tb: ThermalBits) -> tuple[int, int]:
+    size = len(tb.node)
+    depth = max((int(node.get("level", 0)) for node in tb.node), default=0)
+    return size, depth
 
 
-def write_line(handle, line: str) -> None:
-    print(line)
-    print(line, file=handle)
-    handle.flush()
+def selected_methods(args: argparse.Namespace) -> list[tuple[str, str | None]]:
+    methods: list[tuple[str, str | None]] = [("original", None)]
+    run_all_transforms = not args.energy_oriented and not args.depth_oriented
+
+    if args.energy_oriented or run_all_transforms:
+        methods.append(("eo", ENERGY_ORIENTED))
+    if args.depth_oriented or run_all_transforms:
+        methods.append(("do", DEPTH_ORIENTED))
+
+    return methods
 
 
 def main() -> int:
@@ -85,51 +98,40 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     verilog_files = find_verilog_files(input_dir)
 
-    with output_path.open("w", encoding="utf-8") as out:
-        write_line(
+    methods = selected_methods(args)
+    with output_path.open("w", encoding="utf-8", newline="") as out:
+        writer = csv.DictWriter(
             out,
-            (
-                f"# inicio={datetime.now().isoformat(timespec='seconds')}"
-                f"\tinput_dir={input_dir}"
-                f"\toutput={output_path}"
-                f"\tchunks={args.chunks}"
-                f"\tparallel_chunks={args.parallel_chunks}"
-                f"\tenergy_oriented={args.energy_oriented}"
-                f"\tdepth_oriented={args.depth_oriented}"
-                f"\ttotal_files={len(verilog_files)}"
-            ),
+            fieldnames=["file", "method", "size", "depth", "energy"],
         )
+        writer.writeheader()
+        out.flush()
+
+        print(f"input_dir={input_dir}")
+        print(f"output={output_path}")
+        print(f"chunks={args.chunks}")
+        print(f"parallel_chunks={args.parallel_chunks}")
+        print(f"methods={','.join(label for label, _method in methods)}")
+        print(f"total_files={len(verilog_files)}")
 
         if not verilog_files:
-            write_line(out, "Nenhum arquivo Verilog encontrado.")
+            print("Nenhum arquivo Verilog encontrado.")
             return 0
 
         total_started = time.perf_counter()
         ok_count = 0
         error_count = 0
 
-        methods: list[tuple[str, int | None]] = [("original", None)]
-        if args.depth_oriented:
-            methods.append(("DO", DEPTH_ORIENTED))
-        if args.energy_oriented:
-            methods.append(("EO", ENERGY_ORIENTED))
-
         for verilog_path in verilog_files:
-            print(f"Tentando arquivo {verilog_path}")
             relative_path = str(verilog_path.relative_to(input_dir))
+            print(f"Arquivo: {relative_path}")
 
             try:
                 tb = ThermalBits(str(verilog_path))
             except Exception as exc:
-                elapsed_s = 0.0
-                write_line(
-                    out,
-                    format_result(
-                        "ERROR",
-                        relative_path,
-                        f"{type(exc).__name__}: {exc}",
-                        elapsed_s,
-                    ),
+                print(
+                    f"ERROR\t{relative_path}\tload\t{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
                 )
                 error_count += 1
                 continue
@@ -137,44 +139,43 @@ def main() -> int:
             for label, method in methods:
                 started = time.perf_counter()
                 try:
-                    if method is not None:
-                        variant = tb.copy().apply(method)
-                    else:
-                        variant = tb
-                    entropy = variant.update_entropy(chunks=args.chunks, parallel_chunks=args.parallel_chunks)
+                    variant = tb.copy().apply(method) if method is not None else tb
+                    size, depth = circuit_size_and_depth(variant)
+                    energy = variant.update_entropy(
+                        chunks=args.chunks,
+                        parallel_chunks=args.parallel_chunks,
+                    )
                     elapsed_s = time.perf_counter() - started
-                    write_line(
-                        out,
-                        format_result(
-                            "OK",
-                            relative_path,
-                            f"method={label}\tentropy={entropy:.6f}",
-                            elapsed_s,
-                        ),
+                    writer.writerow(
+                        {
+                            "file": relative_path,
+                            "method": label,
+                            "size": size,
+                            "depth": depth,
+                            "energy": f"{energy:.6f}",
+                        }
+                    )
+                    out.flush()
+                    print(
+                        f"OK\t{relative_path}\t{label}"
+                        f"\tsize={size}\tdepth={depth}\tenergy={energy:.6f}"
+                        f"\telapsed_s={elapsed_s:.3f}"
                     )
                     ok_count += 1
                 except Exception as exc:
                     elapsed_s = time.perf_counter() - started
-                    write_line(
-                        out,
-                        format_result(
-                            "ERROR",
-                            relative_path,
-                            f"method={label}\t{type(exc).__name__}: {exc}",
-                            elapsed_s,
-                        ),
+                    print(
+                        f"ERROR\t{relative_path}\t{label}"
+                        f"\t{type(exc).__name__}: {exc}"
+                        f"\telapsed_s={elapsed_s:.3f}",
+                        file=sys.stderr,
                     )
                     error_count += 1
 
         total_elapsed = time.perf_counter() - total_started
-        write_line(
-            out,
-            (
-                f"# fim={datetime.now().isoformat(timespec='seconds')}"
-                f"\tok={ok_count}"
-                f"\terros={error_count}"
-                f"\ttotal_elapsed_s={total_elapsed:.3f}"
-            ),
+        print(
+            f"fim\tok={ok_count}\terros={error_count}"
+            f"\ttotal_elapsed_s={total_elapsed:.3f}"
         )
 
     return 0 if error_count == 0 else 2

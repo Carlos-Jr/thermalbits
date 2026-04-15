@@ -162,19 +162,24 @@ To visualize the circuit as a DAG (Directed Acyclic Graph):
 ```python
 from thermalbits import ThermalBits
 
-tb = ThermalBits("netlist.v")
+tb = ThermalBits("test_files/half_adder.v")
 tb.visualize_dag(
     output_path="dag_horizontal.png",
     orientation="horizontal",      # or "vertical"
-    level_window=[4, 10],          # optional: shows only levels 4..10
+    level_window=[1, 3],           # optional: shows only levels 1..3
 )
 ```
 
 #### Node styling
 
-Primary inputs and primary outputs are shown as black nodes. Internal gates are
-white by default, and gates with more than one fanout target are highlighted in
-blue.
+All nodes are drawn as circles. Primary inputs are shown as black nodes.
+Internal gates and primary outputs are white by default. A gate is highlighted
+in blue only when its fanout entries use different operators, such as an `&`
+output plus a WIRE (`-`) output.
+
+Primary outputs are marked outside the node with a short output line labeled
+`PO0`, `PO1`, and so on. Non-PI node labels use the node id minus the number of
+PIs plus the operation symbol, for example `& 0`.
 
 #### Edge styling
 
@@ -200,7 +205,7 @@ The renderer encodes extra information on the edges themselves:
 
   Higher indices wrap around the same palette.
 
-The images below were generated using `test_files/simple.v`:
+The images below were generated using `test_files/half_adder.v`:
 
 **Horizontal (all levels):**
 
@@ -215,7 +220,7 @@ To get these exact images in your environment:
 ```python
 from thermalbits import ThermalBits
 
-tb = ThermalBits("test_files/simple.v")
+tb = ThermalBits("test_files/half_adder.v")
 tb.visualize_dag(
     output_path="dag_horizontal_test.png",
     orientation="horizontal",
@@ -227,51 +232,26 @@ tb.visualize_dag(
 )
 ```
 
-To see the fanout color scheme in action, build a small circuit with a
-multi-output node by hand:
+To see the fanout color scheme in action, apply the energy-oriented
+optimization to the same half adder. The transformation adds WIRE fanouts to
+serialize repeated uses of the same signal, so nodes with functionally distinct
+fanout entries are highlighted and their output indices are drawn with
+different edge colors:
 
 ```python
-from thermalbits import ThermalBits
+from thermalbits import ENERGY_ORIENTED, ThermalBits
 
-tb = ThermalBits()
-tb.file_name = "multi_output_example"
-tb.pi = [0, 1, 2]
-tb.po = [4, 5]
-tb.node = [
-    {
-        "id": 3,
-        "fanin": [[0, 0], [1, 0], [2, 0]],
-        "fanout": [
-            {"input": [0, 1], "invert": [0, 0], "op": "&"},
-            {"input": [0, 2], "invert": [1, 0], "op": "|"},
-            {"input": [1, 2], "invert": [0, 0], "op": "^"},
-        ],
-        "level": 1,
-        "suport": [0, 1, 2],
-    },
-    {
-        "id": 4,
-        "fanin": [[3, 0], [3, 1]],
-        "fanout": [{"input": [0, 1], "invert": [0, 0], "op": "&"}],
-        "level": 2,
-        "suport": [0, 1, 2],
-    },
-    {
-        "id": 5,
-        "fanin": [[3, 2], [0, 0]],
-        "fanout": [{"input": [0, 1], "invert": [0, 1], "op": "|"}],
-        "level": 2,
-        "suport": [0, 1, 2],
-    },
-]
-tb.visualize_dag(output_path="dag_multi_output_test.png", orientation="horizontal")
+tb = ThermalBits("test_files/half_adder.v").apply(ENERGY_ORIENTED)
+tb.visualize_dag(
+    output_path="dag_multi_output_test.png",
+    orientation="horizontal",
+)
 ```
 
-<img src="dag_multi_output_test.png" alt="Multi-output DAG showing fanout colors" width="520" />
+<img src="dag_multi_output_test.png" alt="Energy-oriented half adder DAG showing fanout colors" width="520" />
 
-Note the black edge (output 0) and red edge (output 1) from node 3 into
-node 4, the blue edge (output 2) from node 3 into node 5, and the dashed
-edge from PI 0 into node 5 marking the inverted input.
+Note how the optimized half adder keeps the original logic outputs while adding
+WIRE outputs for serialized fanout. Dashed edges still mark inverted inputs.
 
 If necessary, install the visualization dependency:
 

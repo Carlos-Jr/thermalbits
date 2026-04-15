@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import heapq
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from typing import Callable
 
@@ -17,6 +17,9 @@ Node = dict[str, object]
 NodeLookup = dict[int, Node]
 SourceRef = tuple[int, int]
 SelectionPolicy = Callable[[list[int]], list[int]]
+ChildrenIndex = dict[SourceRef, set[int]]
+NodeChildrenIndex = dict[int, set[int]]
+NodePredecessorIndex = dict[int, set[int]]
 
 
 def _require_int_list(field_name: str, values: object) -> list[int]:
@@ -147,7 +150,7 @@ def _source_refs(pis: list[int], node_by_id: NodeLookup) -> list[SourceRef]:
 
     refs: list[SourceRef] = [(pi_id, 0) for pi_id in pis]
     for node_id in sorted(node_by_id):
-        for output_index, fanout_entry in enumerate(_fanout_list(node_by_id[node_id])):
+        for output_index, fanout_entry in enumerate(node_by_id[node_id]["fanout"]):
             if fanout_entry.get("op") != "-":
                 refs.append((node_id, output_index))
     return refs
@@ -157,7 +160,7 @@ def _build_children_index(
     nodes: list[Node],
     pis: list[int],
     node_by_id: NodeLookup,
-) -> dict[SourceRef, list[int]]:
+) -> ChildrenIndex:
     """Map each source signal to the internal nodes that consume it.
 
     Connections through wire (op='-') fanouts represent forwarded signals and
@@ -167,26 +170,21 @@ def _build_children_index(
     """
 
     valid_sources = set(_source_refs(pis, node_by_id))
-    children: dict[SourceRef, set[int]] = {
-        source_ref: set() for source_ref in valid_sources
-    }
+    children: ChildrenIndex = {source_ref: set() for source_ref in valid_sources}
 
     for node in nodes:
         child_id = int(node["id"])
-        for source_id, output_index in _fanin_list(node):
+        for source_id, output_index in node["fanin"]:
             source_ref = (source_id, output_index)
             if source_ref in valid_sources:
                 children[source_ref].add(child_id)
 
-    return {
-        source_ref: sorted(children[source_ref])
-        for source_ref in sorted(children)
-    }
+    return children
 
 
 def _ranked_children(
     source_ref: SourceRef,
-    children_index: dict[SourceRef, list[int]],
+    children_index: ChildrenIndex,
     node_by_id: NodeLookup,
 ) -> list[tuple[int, list[int]]]:
     """Group direct children by level in ascending order."""
@@ -220,7 +218,8 @@ def _add_wire_fanout(node: Node, local_fanin_idx: int) -> int:
     Garante que *node* tenha um fanout WIRE (op="-") que repassa o input
     local_fanin_idx sem inversao.  Retorna o indice do fanout (novo ou existente).
     """
-    for i, entry in enumerate(_fanout_list(node)):
+    fanout = node["fanout"]
+    for i, entry in enumerate(fanout):
         if (
             entry.get("op") == "-"
             and entry.get("input") == [local_fanin_idx]
@@ -228,15 +227,15 @@ def _add_wire_fanout(node: Node, local_fanin_idx: int) -> int:
         ):
             return i
 
-    new_idx = len(node["fanout"])
-    node["fanout"].append({"op": "-", "input": [local_fanin_idx], "invert": [0]})
+    new_idx = len(fanout)
+    fanout.append({"op": "-", "input": [local_fanin_idx], "invert": [0]})
     return new_idx
 
 
 def _normalize_node_fanin(node: Node) -> None:
     """Collapse duplicate fanin references and update local input indices."""
 
-    fanin = _fanin_list(node)
+    fanin = node["fanin"]
     if not fanin:
         return
 
@@ -257,7 +256,7 @@ def _normalize_node_fanin(node: Node) -> None:
         return
 
     node["fanin"] = deduped_fanin
-    for fanout_entry in _fanout_list(node):
+    for fanout_entry in node["fanout"]:
         input_indices = fanout_entry["input"]
         fanout_entry["input"] = [index_remap[input_idx] for input_idx in input_indices]
 
@@ -266,7 +265,7 @@ def _make_chain(
     source_ref: SourceRef,
     choices: list[int],
     node_by_id: NodeLookup,
-) -> bool:
+) -> tuple[bool, set[int]]:
     """
     Constroi uma cadeia de fanouts a partir de source_ref.
 
@@ -278,16 +277,17 @@ def _make_chain(
     carrega o sinal repassado de source_ref.
     """
     if not choices:
-        return False
+        return False, set()
 
     changed = False
+    rewired_children: set[int] = set()
     previous_id: int | None = None
     # indice local no `previous_id` que carrega o sinal de source_ref
     carry_fanin_idx: int | None = None
 
     for index, child_id in enumerate(choices):
         child_node = node_by_id[child_id]
-        child_fanin = _fanin_list(child_node)
+        child_fanin = child_node["fanin"]
 
         if index == 0:
             # choices[0] le source_ref diretamente; apenas localiza o indice de carry.
@@ -311,85 +311,249 @@ def _make_chain(
                     ref[0] = previous_id
                     ref[1] = wire_idx
                     changed = True
+                    rewired_children.add(child_id)
 
             _normalize_node_fanin(child_node)
 
             # Atualiza carry para a proxima iteracao: acha o indice local
             # de [previous_id, wire_idx] no fanin normalizado.
             carry_fanin_idx = None
-            for k, (src, out) in enumerate(_fanin_list(child_node)):
+            for k, (src, out) in enumerate(child_node["fanin"]):
                 if src == previous_id and out == wire_idx:
                     carry_fanin_idx = k
                     break
 
         previous_id = child_id
-    return changed
+    return changed, rewired_children
 
 
-def _recompute_levels_and_support(nodes: list[Node], pis: list[int]) -> None:
-    """Rebuild topological levels and PI supports after rewiring."""
+def _node_predecessor_ids(
+    node: Node,
+    pi_set: set[int],
+    node_by_id: NodeLookup,
+) -> set[int]:
+    node_id = int(node["id"])
+    predecessors: set[int] = set()
 
-    node_by_id = _build_node_lookup(nodes)
-    pi_set = set(pis)
-    node_ids = set(node_by_id)
-
-    children_by_id: dict[int, set[int]] = {node_id: set() for node_id in node_ids}
-    indegree: dict[int, int] = {}
-
-    for node_id, node in node_by_id.items():
-        predecessors: set[int] = set()
-        for source_id, output_index in _fanin_list(node):
-            if source_id in pi_set:
-                if output_index != 0:
-                    raise ValueError(
-                        f"Node {node_id} references primary input {source_id} with invalid output index {output_index}"
-                    )
-                continue
-            if source_id not in node_ids:
-                raise ValueError(f"Node {node_id} references unknown fanin id: {source_id}")
-            if output_index >= len(_fanout_list(node_by_id[source_id])):
+    for source_id, output_index in node["fanin"]:
+        if source_id in pi_set:
+            if output_index != 0:
                 raise ValueError(
-                    f"Node {node_id} references node {source_id} output index {output_index}, but that node has only {len(_fanout_list(node_by_id[source_id]))} outputs"
+                    f"Node {node_id} references primary input {source_id} with invalid output index {output_index}"
                 )
-            predecessors.add(source_id)
-            children_by_id[source_id].add(node_id)
-        indegree[node_id] = len(predecessors)
+            continue
+        source_node = node_by_id.get(source_id)
+        if source_node is None:
+            raise ValueError(f"Node {node_id} references unknown fanin id: {source_id}")
+        source_fanout_count = len(source_node["fanout"])
+        if output_index >= source_fanout_count:
+            raise ValueError(
+                f"Node {node_id} references node {source_id} output index {output_index}, but that node has only {source_fanout_count} outputs"
+            )
+        predecessors.add(source_id)
 
+    return predecessors
+
+
+def _build_dependency_index(
+    nodes: list[Node],
+    pis: list[int],
+    node_by_id: NodeLookup,
+) -> tuple[NodeChildrenIndex, NodePredecessorIndex]:
+    """Build node dependency indexes without revalidating the whole schema."""
+
+    pi_set = set(pis)
+    children_by_id: NodeChildrenIndex = {node_id: set() for node_id in node_by_id}
+    predecessors_by_id: NodePredecessorIndex = {}
+
+    for node in nodes:
+        node_id = int(node["id"])
+        predecessors = _node_predecessor_ids(node, pi_set, node_by_id)
+        predecessors_by_id[node_id] = predecessors
+        for source_id in predecessors:
+            children_by_id[source_id].add(node_id)
+
+    return children_by_id, predecessors_by_id
+
+
+def _build_node_children_and_indegree(
+    nodes: list[Node],
+    pis: list[int],
+    node_by_id: NodeLookup,
+) -> tuple[NodeChildrenIndex, dict[int, int]]:
+    children_by_id, predecessors_by_id = _build_dependency_index(nodes, pis, node_by_id)
+    indegree = {
+        node_id: len(predecessors)
+        for node_id, predecessors in predecessors_by_id.items()
+    }
+    return children_by_id, indegree
+
+
+def _topological_node_ids(
+    children_by_id: NodeChildrenIndex,
+    indegree: dict[int, int],
+) -> list[int]:
     ready: list[int] = [node_id for node_id, count in indegree.items() if count == 0]
     heapq.heapify(ready)
 
-    level_by_id: dict[int, int] = {}
-    support_by_id: dict[int, list[int]] = {}
-    processed = 0
-
+    ordered: list[int] = []
     while ready:
         node_id = heapq.heappop(ready)
-        node = node_by_id[node_id]
+        ordered.append(node_id)
 
-        max_level = 0
-        support_set: set[int] = set()
-        for source_id, _output_index in _fanin_list(node):
-            if source_id in pi_set:
-                support_set.add(source_id)
-            else:
-                max_level = max(max_level, level_by_id[source_id])
-                support_set.update(support_by_id[source_id])
-
-        node["level"] = max_level + 1 if _fanin_list(node) else 0
-        node["suport"] = sorted(support_set)
-        level_by_id[node_id] = int(node["level"])
-        support_by_id[node_id] = list(node["suport"])
-        processed += 1
-
-        for child_id in sorted(children_by_id[node_id]):
+        for child_id in children_by_id[node_id]:
             indegree[child_id] -= 1
             if indegree[child_id] == 0:
                 heapq.heappush(ready, child_id)
 
-    if processed != len(node_by_id):
+    if len(ordered) != len(indegree):
         raise ValueError("Transformation created a cycle in the circuit overview")
+    return ordered
+
+
+def _rebuild_level_state(
+    nodes: list[Node],
+    pis: list[int],
+    node_by_id: NodeLookup,
+) -> tuple[int, NodeChildrenIndex, NodePredecessorIndex]:
+    children_by_id, predecessors_by_id = _build_dependency_index(nodes, pis, node_by_id)
+    indegree = {
+        node_id: len(predecessors)
+        for node_id, predecessors in predecessors_by_id.items()
+    }
+    ordered_ids = _topological_node_ids(children_by_id, indegree)
+
+    pi_set = set(pis)
+    max_depth = 0
+    for node_id in ordered_ids:
+        node = node_by_id[node_id]
+        level = _computed_node_level(node, pi_set, node_by_id)
+        node["level"] = level
+        if level > max_depth:
+            max_depth = level
+
+    return max_depth, children_by_id, predecessors_by_id
+
+
+def _computed_node_level(
+    node: Node,
+    pi_set: set[int],
+    node_by_id: NodeLookup,
+) -> int:
+    fanin = node["fanin"]
+    if not fanin:
+        return 0
+
+    max_predecessor_level = 0
+    for source_id, _output_index in fanin:
+        if source_id in pi_set:
+            continue
+        source_level = int(node_by_id[source_id]["level"])
+        if source_level > max_predecessor_level:
+            max_predecessor_level = source_level
+    return max_predecessor_level + 1
+
+
+def _refresh_dependency_index_for_nodes(
+    node_ids: set[int],
+    pis: list[int],
+    node_by_id: NodeLookup,
+    children_by_id: NodeChildrenIndex,
+    predecessors_by_id: NodePredecessorIndex,
+) -> None:
+    pi_set = set(pis)
+    for node_id in node_ids:
+        old_predecessors = predecessors_by_id[node_id]
+        new_predecessors = _node_predecessor_ids(
+            node_by_id[node_id],
+            pi_set,
+            node_by_id,
+        )
+
+        for removed_id in old_predecessors - new_predecessors:
+            children_by_id[removed_id].discard(node_id)
+        for added_id in new_predecessors - old_predecessors:
+            children_by_id[added_id].add(node_id)
+
+        predecessors_by_id[node_id] = new_predecessors
+
+
+def _propagate_levels(
+    start_ids: set[int],
+    pis: list[int],
+    node_by_id: NodeLookup,
+    children_by_id: NodeChildrenIndex,
+    current_depth: int,
+) -> int:
+    pi_set = set(pis)
+    queue = deque(
+        sorted(start_ids, key=lambda node_id: (_node_level(node_by_id[node_id]), node_id))
+    )
+    queued = set(start_ids)
+    max_depth = current_depth
+
+    while queue:
+        node_id = queue.popleft()
+        queued.discard(node_id)
+
+        node = node_by_id[node_id]
+        old_level = int(node["level"])
+        new_level = _computed_node_level(node, pi_set, node_by_id)
+        if new_level == old_level:
+            continue
+
+        node["level"] = new_level
+        if new_level > max_depth:
+            max_depth = new_level
+
+        for child_id in children_by_id[node_id]:
+            if child_id not in queued:
+                queue.append(child_id)
+                queued.add(child_id)
+
+    return max_depth
+
+
+def _recompute_levels_and_support(
+    nodes: list[Node],
+    pis: list[int],
+    node_by_id: NodeLookup,
+) -> int:
+    """Rebuild topological levels and PI supports after rewiring."""
+
+    pi_set = set(pis)
+    children_by_id, indegree = _build_node_children_and_indegree(nodes, pis, node_by_id)
+    ordered_ids = _topological_node_ids(children_by_id, indegree)
+
+    level_by_id: dict[int, int] = {}
+    support_by_id: dict[int, set[int]] = {}
+    max_depth = 0
+
+    for node_id in ordered_ids:
+        node = node_by_id[node_id]
+        fanin = node["fanin"]
+
+        max_predecessor_level = 0
+        support_set: set[int] = set()
+        for source_id, _output_index in fanin:
+            if source_id in pi_set:
+                support_set.add(source_id)
+            else:
+                source_level = level_by_id[source_id]
+                if source_level > max_predecessor_level:
+                    max_predecessor_level = source_level
+                support_set.update(support_by_id[source_id])
+
+        level = max_predecessor_level + 1 if fanin else 0
+        node["level"] = level
+        node["suport"] = sorted(support_set)
+        level_by_id[node_id] = level
+        support_by_id[node_id] = support_set
+        if level > max_depth:
+            max_depth = level
 
     nodes.sort(key=lambda node: int(node["id"]))
+    return max_depth
 
 
 def _select_depth_oriented(valid_children: list[int]) -> list[int]:
@@ -408,6 +572,17 @@ def _current_depth(nodes: list[Node]) -> int:
     """Return the current maximum node level."""
 
     return max((_node_level(node) for node in nodes), default=0)
+
+
+def _snapshot_nodes(node_ids: set[int], node_by_id: NodeLookup) -> dict[int, Node]:
+    return {node_id: deepcopy(node_by_id[node_id]) for node_id in node_ids}
+
+
+def _restore_nodes(snapshot: dict[int, Node], node_by_id: NodeLookup) -> None:
+    for node_id, saved_node in snapshot.items():
+        node = node_by_id[node_id]
+        node.clear()
+        node.update(deepcopy(saved_node))
 
 
 def _build_chain(
@@ -433,8 +608,9 @@ def _build_chain(
 
     nodes = list(node_by_id.values())
     max_allowed_depth = _current_depth(nodes) if preserve_depth else None
+    children_index = _build_children_index(nodes, pis, node_by_id)
     ordered_source_refs = sorted(
-        _source_refs(pis, node_by_id),
+        children_index,
         key=lambda source_ref: (
             _source_level(source_ref, node_by_id),
             source_ref[0],
@@ -442,14 +618,16 @@ def _build_chain(
         ),
         reverse=True,
     )
+    current_depth, node_children_by_id, predecessors_by_id = _rebuild_level_state(
+        nodes,
+        pis,
+        node_by_id,
+    )
 
     for source_ref in ordered_source_refs:
         used_children: set[int] = set()
 
         while True:
-            _recompute_levels_and_support(nodes, pis)
-            node_by_id = _build_node_lookup(nodes)
-            children_index = _build_children_index(nodes, pis, node_by_id)
             choices: list[int] = []
             for _level, grouped_children in _ranked_children(
                 source_ref,
@@ -465,23 +643,49 @@ def _build_chain(
             if len(ordered_choices) <= 1:
                 break
 
-            snapshot = deepcopy(nodes) if max_allowed_depth is not None else None
-            changed = _make_chain(source_ref, ordered_choices, node_by_id)
+            snapshot = (
+                _snapshot_nodes(set(ordered_choices), node_by_id)
+                if max_allowed_depth is not None
+                else None
+            )
+            changed, rewired_children = _make_chain(
+                source_ref,
+                ordered_choices,
+                node_by_id,
+            )
             if not changed:
                 used_children.update(ordered_choices)
                 break
 
-            _recompute_levels_and_support(nodes, pis)
-            if max_allowed_depth is not None and _current_depth(nodes) > max_allowed_depth:
+            _refresh_dependency_index_for_nodes(
+                rewired_children,
+                pis,
+                node_by_id,
+                node_children_by_id,
+                predecessors_by_id,
+            )
+            current_depth = _propagate_levels(
+                rewired_children,
+                pis,
+                node_by_id,
+                node_children_by_id,
+                current_depth,
+            )
+            if max_allowed_depth is not None and current_depth > max_allowed_depth:
                 if snapshot is None:
                     raise AssertionError("missing snapshot for depth-preserving rollback")
-                nodes[:] = snapshot
-                node_by_id = _build_node_lookup(nodes)
+                _restore_nodes(snapshot, node_by_id)
+                current_depth, node_children_by_id, predecessors_by_id = _rebuild_level_state(
+                    nodes,
+                    pis,
+                    node_by_id,
+                )
                 break
 
+            children_index[source_ref].difference_update(rewired_children)
             used_children.update(ordered_choices)
 
-    _recompute_levels_and_support(nodes, pis)
+    _recompute_levels_and_support(nodes, pis, node_by_id)
     overview["nodes"] = nodes
     return overview
 
