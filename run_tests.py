@@ -52,6 +52,20 @@ def parse_args() -> argparse.Namespace:
             "selecionado, EO e DO sao executados por padrao."
         ),
     )
+    parser.add_argument(
+        "--images-dir",
+        default=None,
+        help=(
+            "Pasta opcional para salvar imagens PNG dos circuitos de cada "
+            "arquivo/metodo."
+        ),
+    )
+    parser.add_argument(
+        "--image-orientation",
+        choices=("horizontal", "vertical"),
+        default="horizontal",
+        help="Orientacao das imagens geradas com --images-dir (padrao: horizontal).",
+    )
     return parser.parse_args()
 
 
@@ -64,6 +78,11 @@ def circuit_size_and_depth(tb: ThermalBits) -> tuple[int, int]:
     size = len(tb.node)
     depth = max((int(node.get("level", 0)) for node in tb.node), default=0)
     return size, depth
+
+
+def image_output_path(images_dir: Path, relative_path: Path, method: str) -> Path:
+    image_name = f"{relative_path.stem}_{method}.png"
+    return images_dir / relative_path.parent / image_name
 
 
 def selected_methods(args: argparse.Namespace) -> list[tuple[str, str | None]]:
@@ -82,6 +101,11 @@ def main() -> int:
     args = parse_args()
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
+    images_dir = (
+        Path(args.images_dir).expanduser().resolve()
+        if args.images_dir is not None
+        else None
+    )
 
     if not input_dir.is_dir():
         print(f"Pasta nao encontrada: {input_dir}", file=sys.stderr)
@@ -96,13 +120,23 @@ def main() -> int:
         return 1
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if images_dir is not None:
+        images_dir.mkdir(parents=True, exist_ok=True)
     verilog_files = find_verilog_files(input_dir)
 
     methods = selected_methods(args)
     with output_path.open("w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(
             out,
-            fieldnames=["file", "method", "size", "depth", "energy"],
+            fieldnames=[
+                "file",
+                "method",
+                "size",
+                "depth",
+                "energy",
+                "entropy_time_s",
+                "image_path",
+            ],
         )
         writer.writeheader()
         out.flush()
@@ -112,6 +146,9 @@ def main() -> int:
         print(f"chunks={args.chunks}")
         print(f"parallel_chunks={args.parallel_chunks}")
         print(f"methods={','.join(label for label, _method in methods)}")
+        if images_dir is not None:
+            print(f"images_dir={images_dir}")
+            print(f"image_orientation={args.image_orientation}")
         print(f"total_files={len(verilog_files)}")
 
         if not verilog_files:
@@ -123,7 +160,8 @@ def main() -> int:
         error_count = 0
 
         for verilog_path in verilog_files:
-            relative_path = str(verilog_path.relative_to(input_dir))
+            relative = verilog_path.relative_to(input_dir)
+            relative_path = str(relative)
             print(f"Arquivo: {relative_path}")
 
             try:
@@ -141,10 +179,21 @@ def main() -> int:
                 try:
                     variant = tb.copy().apply(method) if method is not None else tb
                     size, depth = circuit_size_and_depth(variant)
+                    entropy_started = time.perf_counter()
                     energy = variant.update_entropy(
                         chunks=args.chunks,
                         parallel_chunks=args.parallel_chunks,
                     )
+                    entropy_time_s = time.perf_counter() - entropy_started
+                    image_path = ""
+                    if images_dir is not None:
+                        png_path = image_output_path(images_dir, relative, label)
+                        png_path.parent.mkdir(parents=True, exist_ok=True)
+                        variant.visualize_dag(
+                            str(png_path),
+                            orientation=args.image_orientation,
+                        )
+                        image_path = str(png_path)
                     elapsed_s = time.perf_counter() - started
                     writer.writerow(
                         {
@@ -153,12 +202,16 @@ def main() -> int:
                             "size": size,
                             "depth": depth,
                             "energy": f"{energy:.6f}",
+                            "entropy_time_s": f"{entropy_time_s:.3f}",
+                            "image_path": image_path,
                         }
                     )
                     out.flush()
                     print(
                         f"OK\t{relative_path}\t{label}"
                         f"\tsize={size}\tdepth={depth}\tenergy={energy:.6f}"
+                        f"\tentropy_time_s={entropy_time_s:.3f}"
+                        f"\timage={image_path or '-'}"
                         f"\telapsed_s={elapsed_s:.3f}"
                     )
                     ok_count += 1

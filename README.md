@@ -353,6 +353,32 @@ Chunks are dispatched in successive batches of `parallel_chunks` until all `chun
 
 > **Note:** chunk mode requires n_pis ≤ 63 (hardware limit of the 64-bit simulator).
 
+### Batch CSV reports
+
+To run the entropy flow over all Verilog files in a directory and save a CSV report:
+
+```bash
+python run_tests.py test_files -o entropy_results.csv --chunks 2 --parallel_chunks 2
+```
+
+By default, the script records three versions for each circuit: `original`, `eo` (energy-oriented optimization), and `do` (depth-oriented optimization). To restrict the report, use `--energy-oriented` or `--depth-oriented`; the original circuit is still included as the baseline.
+
+The CSV columns are:
+
+```text
+file,method,size,depth,energy,entropy_time_s,image_path
+```
+
+`entropy_time_s` is the time spent calculating entropy for that circuit/method pair. `image_path` is empty unless image generation is enabled.
+
+To also generate circuit images:
+
+```bash
+python run_tests.py test_files -o entropy_results.csv --images-dir dag_outputs --image-orientation horizontal
+```
+
+Use `--image-orientation vertical` to save vertical DAG images instead. Files that fail to parse or process are reported on stderr, and successful rows are still written to the CSV.
+
 ## Observations
 * Assignments support `&`, `|`, and `~` (no `^`, `+`, etc.). One-bit constants `1'b0` and `1'b1` are also accepted.
 * Each `assign` generates one node with a single `fanout` entry. Unary assignments are emitted with `op: "-"`.
