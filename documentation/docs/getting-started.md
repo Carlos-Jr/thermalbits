@@ -20,6 +20,16 @@ For development:
 python -m pip install -r requirements-dev.txt
 ```
 
+## Build package artifacts
+
+To build the package distribution files:
+
+```bash
+python -m build
+```
+
+The generated artifacts are written to `dist/`.
+
 ## Build the Rust simulator
 
 `update_entropy()` calls the `circuit_sim` binary located at
@@ -38,6 +48,8 @@ cd ../..
 ```
 
 ## Load a circuit
+
+Input paths can be absolute or relative to the current working directory.
 
 ```python
 from thermalbits import ThermalBits
@@ -76,3 +88,12 @@ tb.visualize_dag("half_adder.png", orientation="horizontal")
 ```
 
 Use `orientation="vertical"` for the vertical layout.
+
+## Verilog parser notes
+
+- The parser supports combinational `assign` expressions using `&`, `|`, and
+  `~`.
+- One-bit constants `1'b0` and `1'b1` are accepted.
+- Operators such as `^` and `+` are not parsed from Verilog input.
+- Each `assign` generates one node with a single `fanout` entry.
+- Unary assignments are represented with `op: "-"`.

@@ -14,6 +14,16 @@ from thermalbits import DEPTH_ORIENTED, ENERGY_ORIENTED, ThermalBits
 | `ENERGY_ORIENTED` | Energy-oriented (EO) | Maximize energy reduction, allowing circuit depth to increase. |
 | `DEPTH_ORIENTED` | Depth-oriented / Delay-oriented (DO) | Reduce energy while preserving the original circuit depth. |
 
+The implemented methods are based on the EO and DO algorithms described in:
+
+CHAVES, Jeferson F. et al. Enhancing fundamental energy limits of
+field-coupled nanocomputing circuits. In: 2018 IEEE International Symposium on
+Circuits and Systems (ISCAS). IEEE, 2018. p. 1-5.
+
+The depth-oriented method selects at most one child per rank when building
+fanout chains. The energy-oriented method can serialize multiple children in
+the same rank and may increase circuit depth.
+
 ## Apply a transformation
 
 `apply()` mutates the object and returns the same instance.
