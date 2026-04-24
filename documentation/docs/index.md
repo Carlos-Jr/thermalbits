@@ -12,7 +12,8 @@ total Shannon entropy related to information loss at logic gates.
 - Export the current circuit state to JSON.
 - Rebuild Verilog from the current state.
 - Render DAG images with Matplotlib and NetworkX.
-- Apply the `ENERGY_ORIENTED` and `DEPTH_ORIENTED` methods.
+- Apply the `ENERGY_ORIENTED` and `DEPTH_ORIENTED` methods with the bundled
+  parallel Rust transformer.
 - Compute Shannon entropy with the bundled Rust simulator.
 - Run batch experiments with `run_tests.py` and save CSV reports.
 

@@ -3,7 +3,7 @@
 ## Requirements
 
 - Python 3.10 or newer.
-- Rust/Cargo to build the entropy simulator.
+- Rust/Cargo to build the entropy simulator and the EO/DO transformer.
 - `matplotlib` and `networkx` for DAG visualization.
 
 ## Install library dependencies
@@ -46,6 +46,36 @@ Then return to the repository root before running the examples:
 ```bash
 cd ../..
 ```
+
+## Build the Rust EO/DO transformer
+
+`apply(ENERGY_ORIENTED)` and `apply(DEPTH_ORIENTED)` call the `eo_do_rs`
+binary located at `thermalbits/eo_do_rs/target/release/eo_do_rs`. It is
+parallelized with `rayon` and reads/writes the overview JSON from disk, so the
+Python `ThermalBits` object always ends up with `file_name`, `pi`, `po`, and
+`node` refreshed from the transformed result. Build it once before running
+`apply()`:
+
+```bash
+cd thermalbits/eo_do_rs
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+cd ../..
+```
+
+`RUSTFLAGS="-C target-cpu=native"` enables CPU-specific instructions
+(AVX2, AVX-512, BMI2, …) and yields a noticeably faster binary on the same
+machine that compiled it. Drop the flag if you need a portable build.
+
+If the binary is missing, `apply()` falls back to the Python reference
+implementation and emits a `RuntimeWarning`. Three environment variables control
+the dispatch:
+
+| Variable | Effect |
+|---|---|
+| `THERMALBITS_EODO_BACKEND=auto` | Default. Prefer Rust; fall back to Python with a warning when the binary is missing. |
+| `THERMALBITS_EODO_BACKEND=rust` | Require the Rust binary; raise `RuntimeError` when it is unavailable. |
+| `THERMALBITS_EODO_BACKEND=python` | Force the Python reference implementation. |
+| `THERMALBITS_EODO_BIN=/path/to/eo_do_rs` | Override the binary location. |
 
 ## Load a circuit
 

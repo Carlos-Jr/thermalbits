@@ -49,7 +49,8 @@ tb2 = tb.copy()
 ## `apply(method)`
 
 Applies a registered transformation to the current circuit. The method mutates
-the object and returns the same instance.
+the object (refreshes `file_name`, `pi`, `po`, `node`, and resets `entropy`) and
+returns the same instance.
 
 ```python
 tb.apply(ENERGY_ORIENTED)
@@ -59,6 +60,15 @@ Accepted methods:
 
 - `ENERGY_ORIENTED`
 - `DEPTH_ORIENTED`
+
+The transformation runs through the `eo_do_rs` Rust binary
+(`thermalbits/eo_do_rs/target/release/eo_do_rs`), parallelized with `rayon`.
+Build it once with `RUSTFLAGS="-C target-cpu=native" cargo build --release`
+inside `thermalbits/eo_do_rs/`.
+If the binary is missing, `apply()` falls back to the Python reference
+implementation and emits a `RuntimeWarning`. See
+[Apply Optimizations](../guides/optimization.md) for the
+`THERMALBITS_EODO_BACKEND` and `THERMALBITS_EODO_BIN` environment variables.
 
 ## `update_entropy(chunks=2, parallel_chunks=2)`
 

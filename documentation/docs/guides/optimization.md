@@ -24,6 +24,38 @@ The depth-oriented method selects at most one child per rank when building
 fanout chains. The energy-oriented method can serialize multiple children in
 the same rank and may increase circuit depth.
 
+## Rust backend for EO/DO
+
+The transformation is delegated to the Rust binary `eo_do_rs`, bundled under
+`thermalbits/eo_do_rs/` and parallelized with [`rayon`](https://crates.io/crates/rayon).
+`apply()` serializes the current circuit to JSON, invokes the binary, and reads
+the transformed overview back so that `file_name`, `pi`, `po`, and `node` on
+the `ThermalBits` instance are always updated in place.
+
+Build it once before calling `apply()`:
+
+```bash
+cd thermalbits/eo_do_rs
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+cd ../..
+```
+
+`RUSTFLAGS="-C target-cpu=native"` enables CPU-specific optimizations and
+produces a noticeably faster binary on the same machine that compiled it. Drop
+the flag if the binary must be portable across hosts.
+
+If the binary cannot be located, `apply()` falls back to the Python reference
+implementation and emits a `RuntimeWarning`. The dispatch is controlled by two
+environment variables:
+
+| Variable | Values | Effect |
+|---|---|---|
+| `THERMALBITS_EODO_BACKEND` | `auto` (default), `rust`, `python` | Select dispatch policy. `rust` turns a missing binary into an error; `python` forces the reference implementation. |
+| `THERMALBITS_EODO_BIN` | absolute path | Override where `apply()` looks for the binary. |
+
+Both backends produce byte-identical overviews for the same input, so switching
+only affects performance.
+
 ## Apply a transformation
 
 `apply()` mutates the object and returns the same instance.
